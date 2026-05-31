@@ -1,0 +1,15 @@
+# Keeps the SHA-pinned GitHub Actions in .github/workflows current. Without an updater,
+# pinned SHAs silently freeze on versions that may grow known CVEs. Dependabot bumps both
+# the SHA and its `# vX.Y.Z` comment, grouped into a single weekly PR.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+    groups:
+      github-actions:
+        patterns:
+          - "*"
