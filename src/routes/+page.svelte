@@ -1,156 +1,142 @@
 <script lang="ts">
-import { invoke } from '@tauri-apps/api/core';
+import { onMount } from 'svelte';
+import {
+  fetchClaudeUsage,
+  onUsageError,
+  onUsageUpdated,
+  type UsageSnapshot,
+  type UsageWindow,
+} from '$lib/usage';
 
-let name = $state('');
-let greetMsg = $state('');
+let snapshot = $state<UsageSnapshot | null>(null);
+let error = $state<string | null>(null);
+let loading = $state(true);
+let now = $state(Date.now());
 
-async function greet(event: Event) {
-  event.preventDefault();
-  // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-  greetMsg = await invoke('greet', { name });
+const KIND_LABEL: Record<UsageWindow['kind'], string> = {
+  Session: 'Session',
+  Weekly: 'Weekly',
+  Monthly: 'Monthly',
+  Custom: 'Usage',
+};
+
+function label(w: UsageWindow): string {
+  return w.reset_description ?? KIND_LABEL[w.kind];
 }
+
+function barColor(pct: number): string {
+  if (pct >= 90) return 'bg-red-500';
+  if (pct >= 70) return 'bg-amber-500';
+  return 'bg-emerald-500';
+}
+
+function countdown(resetsAt: number | null): string {
+  if (resetsAt == null) return '';
+  const ms = resetsAt - now;
+  if (ms <= 0) return 'resetting…';
+  const mins = Math.floor(ms / 60000);
+  const d = Math.floor(mins / 1440);
+  const h = Math.floor((mins % 1440) / 60);
+  const m = mins % 60;
+  if (d > 0) return `resets in ${d}d ${h}h`;
+  if (h > 0) return `resets in ${h}h ${m}m`;
+  return `resets in ${m}m`;
+}
+
+function lastUpdated(ms: number): string {
+  return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+onMount(() => {
+  const unlisteners: Array<() => void> = [];
+
+  fetchClaudeUsage()
+    .then((s) => {
+      snapshot = s;
+      error = null;
+    })
+    .catch((e) => {
+      error = String(e);
+    })
+    .finally(() => {
+      loading = false;
+    });
+
+  onUsageUpdated((s) => {
+    snapshot = s;
+    error = null;
+    loading = false;
+  }).then((u) => unlisteners.push(u));
+  onUsageError((msg) => {
+    error = msg;
+  }).then((u) => unlisteners.push(u));
+
+  const tick = setInterval(() => {
+    now = Date.now();
+  }, 1000);
+
+  return () => {
+    clearInterval(tick);
+    for (const u of unlisteners) u();
+  };
+});
 </script>
 
-<main class="container">
-  <h1>Welcome to Tauri + Svelte</h1>
+<main class="flex h-screen w-screen flex-col bg-neutral-900 font-sans text-neutral-100 select-none">
+  <header class="flex items-center justify-between border-b border-neutral-800 px-4 py-3">
+    <h1 class="text-sm font-semibold tracking-tight">Claude Code</h1>
+    {#if snapshot}
+      <span
+        class="text-[11px] {snapshot.status === 'Ok'
+          ? 'text-emerald-400'
+          : snapshot.status === 'Stale'
+            ? 'text-amber-400'
+            : 'text-red-400'}"
+      >
+        ● {snapshot.status}
+      </span>
+    {/if}
+  </header>
 
-  <div class="row">
-    <a href="https://vite.dev" target="_blank">
-      <img src="/vite.svg" class="logo vite" alt="Vite Logo" />
-    </a>
-    <a href="https://tauri.app" target="_blank">
-      <img src="/tauri.svg" class="logo tauri" alt="Tauri Logo" />
-    </a>
-    <a href="https://svelte.dev" target="_blank">
-      <img src="/svelte.svg" class="logo svelte-kit" alt="SvelteKit Logo" />
-    </a>
-  </div>
-  <p>Click on the Tauri, Vite, and SvelteKit logos to learn more.</p>
+  <section class="flex-1 overflow-y-auto px-4 py-3">
+    {#if loading}
+      <p class="mt-10 text-center text-sm text-neutral-500">Loading usage…</p>
+    {:else if error && !snapshot}
+      <div class="mt-8 text-center">
+        <p class="text-sm text-red-400">Couldn't load usage</p>
+        <p class="mt-2 text-[11px] break-words text-neutral-500">{error}</p>
+      </div>
+    {:else if snapshot}
+      <ul class="space-y-4">
+        {#each snapshot.windows as w (w.kind + (w.reset_description ?? ''))}
+          <li>
+            <div class="mb-1 flex items-baseline justify-between">
+              <span class="text-[13px] font-medium text-neutral-200">{label(w)}</span>
+              <span class="text-[13px] text-neutral-400 tabular-nums">{w.used_percent.toFixed(0)}%</span>
+            </div>
+            <div class="h-2 overflow-hidden rounded-full bg-neutral-800">
+              <div
+                class="h-full rounded-full transition-[width] duration-500 {barColor(w.used_percent)}"
+                style="width: {Math.min(100, Math.max(0, w.used_percent))}%"
+              ></div>
+            </div>
+            {#if countdown(w.resets_at)}
+              <p class="mt-1 text-[11px] text-neutral-500">{countdown(w.resets_at)}</p>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+      {#if error}
+        <p class="mt-4 text-center text-[11px] text-amber-400">stale · {error}</p>
+      {/if}
+    {/if}
+  </section>
 
-  <form class="row" onsubmit={greet}>
-    <input id="greet-input" placeholder="Enter a name..." bind:value={name} />
-    <button type="submit">Greet</button>
-  </form>
-  <p>{greetMsg}</p>
+  <footer class="border-t border-neutral-800 px-4 py-2 text-[11px] text-neutral-500">
+    {#if snapshot}
+      Updated {lastUpdated(snapshot.fetched_at)}
+    {:else}
+      MLT
+    {/if}
+  </footer>
 </main>
-
-<style>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.svelte-kit:hover {
-  filter: drop-shadow(0 0 2em #ff3e00);
-}
-
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
-}
-
-.container {
-  margin: 0;
-  padding-top: 10vh;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  text-align: center;
-}
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
-}
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
-
-  a:hover {
-    color: #24c8db;
-  }
-
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
-}
-
-</style>

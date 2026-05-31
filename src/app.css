@@ -1,0 +1,12 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light dark;
+}
+
+html,
+body {
+  margin: 0;
+  /* The popover is a chromeless window; let the body fill it. */
+  overflow: hidden;
+}
