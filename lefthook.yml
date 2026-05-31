@@ -17,6 +17,8 @@ pre-commit:
       run: make ui-lint
     gitleaks:
       run: gitleaks git --staged --redact
+    task-gate:
+      run: ./scripts/check-task-started.sh
 
 commit-msg:
   commands:

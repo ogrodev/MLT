@@ -1,0 +1,15 @@
+{
+  "name": "mlt-tasks",
+  "version": "1.0.0",
+  "description": "MLT task workflow — /mlt:start-task picks a to-do task, pulls main, branches, and marks it started",
+  "type": "module",
+  "private": true,
+  "omp": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": "*"
+  }
+}
