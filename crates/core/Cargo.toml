@@ -1,0 +1,13 @@
+[package]
+name = "mlt-core"
+version = "0.1.0"
+edition = "2021"
+description = "MLT pure domain model and ports (no IO). See docs/adr/0006-hexagonal-core.md."
+
+# IMPORTANT: this crate must NOT gain any IO-performing dependency (no reqwest, tokio
+# net/fs, sqlx, keyring, std::fs, SystemTime::now). All side effects enter via `ports`.
+# This invariant is enforced by the architecture-fitness gate (docs/QUALITY_GATES.md §2).
+[dependencies]
+serde = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }

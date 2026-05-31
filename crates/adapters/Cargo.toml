@@ -1,0 +1,8 @@
+[package]
+name = "mlt-adapters"
+version = "0.1.0"
+edition = "2021"
+description = "Concrete implementations of mlt-core ports. IO lives here, not in core."
+
+[dependencies]
+mlt-core = { workspace = true }

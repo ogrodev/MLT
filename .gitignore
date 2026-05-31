@@ -3,6 +3,9 @@ node_modules
 /build
 /.svelte-kit
 /package
+
+# Rust / Cargo workspace (target dir now lives at the workspace root)
+/target
 .env
 .env.*
 !.env.example
