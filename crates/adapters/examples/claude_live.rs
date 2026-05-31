@@ -11,7 +11,9 @@ use mlt_core::providers::{FetchContext, FetchStrategy};
 #[tokio::main]
 async fn main() {
     let strategy = claude_strategy();
-    let ctx = FetchContext { provider: ProviderId::new("claude-code") };
+    let ctx = FetchContext {
+        provider: ProviderId::new("claude-code"),
+    };
 
     match strategy.fetch(&ctx).await {
         Ok(snapshot) => {

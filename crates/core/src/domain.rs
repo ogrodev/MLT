@@ -106,7 +106,10 @@ mod tests {
         };
         assert_eq!(w.remaining_percent(), 27.0);
 
-        let over = UsageWindow { used_percent: 140.0, ..w };
+        let over = UsageWindow {
+            used_percent: 140.0,
+            ..w
+        };
         assert_eq!(over.remaining_percent(), 0.0);
     }
 }

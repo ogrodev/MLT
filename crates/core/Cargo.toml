@@ -2,6 +2,7 @@
 name = "mlt-core"
 version = "0.1.0"
 edition = "2021"
+publish = false
 description = "MLT pure domain model and ports (no IO). See docs/adr/0006-hexagonal-core.md."
 
 # IMPORTANT: this crate must NOT gain any IO-performing dependency (no reqwest, tokio

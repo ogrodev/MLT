@@ -11,7 +11,9 @@ pub struct ReqwestHttp {
 
 impl ReqwestHttp {
     pub fn new() -> Self {
-        Self { client: reqwest::Client::new() }
+        Self {
+            client: reqwest::Client::new(),
+        }
     }
 }
 
@@ -33,7 +35,10 @@ impl HttpPort for ReqwestHttp {
         if let Some(body) = req.body {
             builder = builder.body(body);
         }
-        let resp = builder.send().await.map_err(|e| PortError::Io(e.to_string()))?;
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| PortError::Io(e.to_string()))?;
         let status = resp.status().as_u16();
         let body = resp
             .bytes()

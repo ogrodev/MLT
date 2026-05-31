@@ -63,7 +63,11 @@ fn parse_creds(raw: &str) -> Result<OAuthTokens, String> {
     let scopes = o
         .get("scopes")
         .and_then(|x| x.as_array())
-        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let subscription_type = o
         .get("subscriptionType")
@@ -71,13 +75,24 @@ fn parse_creds(raw: &str) -> Result<OAuthTokens, String> {
         .and_then(|x| x.as_str())
         .map(String::from);
 
-    Ok(OAuthTokens { access_token, refresh_token, expires_at, scopes, subscription_type })
+    Ok(OAuthTokens {
+        access_token,
+        refresh_token,
+        expires_at,
+        scopes,
+        subscription_type,
+    })
 }
 
 #[cfg(target_os = "macos")]
 fn read_keychain() -> Option<String> {
     let out = std::process::Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -118,9 +133,18 @@ pub fn claude_strategy() -> ClaudeCodeStrategy {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let bootstrap: Arc<dyn OAuthCredentialSource> = Arc::new(ClaudeCredentials);
     let cache: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore::new(KEYCHAIN_SERVICE));
-    let creds: Arc<dyn OAuthCredentialSource> =
-        Arc::new(ClaudeOAuthRefresher::new(bootstrap, cache, http.clone(), clock.clone()));
-    ClaudeCodeStrategy { creds, http, clock, user_agent: detect_user_agent() }
+    let creds: Arc<dyn OAuthCredentialSource> = Arc::new(ClaudeOAuthRefresher::new(
+        bootstrap,
+        cache,
+        http.clone(),
+        clock.clone(),
+    ));
+    ClaudeCodeStrategy {
+        creds,
+        http,
+        clock,
+        user_agent: detect_user_agent(),
+    }
 }
 
 #[cfg(test)]

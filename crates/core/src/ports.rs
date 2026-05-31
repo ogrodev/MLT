@@ -59,7 +59,8 @@ pub trait Notifier: Send + Sync {
 
 #[async_trait]
 pub trait CalendarPort: Send + Sync {
-    async fn events(&self, from: Timestamp, to: Timestamp) -> Result<Vec<CalendarEvent>, PortError>;
+    async fn events(&self, from: Timestamp, to: Timestamp)
+        -> Result<Vec<CalendarEvent>, PortError>;
 }
 
 #[cfg(test)]
@@ -78,7 +79,9 @@ mod tests {
 
     #[test]
     fn fake_clock_is_deterministic() {
-        let clock = FakeClock { fixed: 1_700_000_000_000 };
+        let clock = FakeClock {
+            fixed: 1_700_000_000_000,
+        };
         assert_eq!(clock.now(), Timestamp(1_700_000_000_000));
     }
 }

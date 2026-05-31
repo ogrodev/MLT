@@ -1,0 +1,31 @@
+# Git hooks for fast local enforcement. Activate once with `make hooks` (or `lefthook install`).
+# Commands delegate to the Makefile so there's a single source of truth shared with CI.
+pre-commit:
+  parallel: true
+  commands:
+    rustfmt:
+      glob: '*.rs'
+      run: make fmt-check
+    clippy:
+      glob: '*.rs'
+      run: make lint
+    core-purity:
+      glob: 'crates/core/**/*.rs'
+      run: make purity
+    biome:
+      glob: '*.{ts,js,jsx,tsx,json,css}'
+      run: make ui-lint
+    gitleaks:
+      run: gitleaks git --staged --redact
+
+commit-msg:
+  commands:
+    conventional:
+      run: |
+        head -1 {1} | grep -qE '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?!?: .+' \
+          || { echo "✗ Commit must follow Conventional Commits, e.g. 'feat(provider): ...'"; exit 1; }
+
+pre-push:
+  commands:
+    test:
+      run: make test

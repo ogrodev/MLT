@@ -2,6 +2,7 @@
 name = "mlt-adapters"
 version = "0.1.0"
 edition = "2021"
+publish = false
 description = "Concrete implementations of mlt-core ports. IO lives here, not in core."
 
 [dependencies]
@@ -11,9 +12,16 @@ serde_json = { workspace = true }
 # rustls keeps TLS portable (no OpenSSL/native-tls) across mac/win/linux.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 dirs = "5"
-# OS keychain for OUR secrets (refreshed tokens). macOS now; add windows-native /
-# sync-secret-service features when those CI targets come online.
+
+# OS keychain for OUR secrets (refreshed tokens), per-OS backend so the workspace builds
+# cross-platform (incl. Linux/Windows CI). Runtime keychain access is only exercised by the
+# real app, never by tests (which use an in-memory fake).
+[target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

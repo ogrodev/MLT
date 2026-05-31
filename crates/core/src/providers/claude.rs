@@ -5,9 +5,9 @@
 //! deliberately lossy (ADR 0015): the endpoint returns a map of window → {utilization,
 //! resets_at} with many null / experimental keys, so unknown or null windows are skipped,
 //! never fatal. See docs/research/PROVIDERS.md.
+use super::{FetchContext, FetchError, FetchKind, FetchStrategy};
 use crate::domain::*;
 use crate::ports::*;
-use super::{FetchContext, FetchError, FetchKind, FetchStrategy};
 use async_trait::async_trait;
 use std::sync::Arc;
 use time::format_description::well_known::Rfc3339;
@@ -38,12 +38,26 @@ fn classify(key: &str) -> (WindowKind, Option<i64>, Option<String>) {
     match key {
         "five_hour" => (WindowKind::Session, Some(300), None),
         "seven_day" => (WindowKind::Weekly, Some(10_080), None),
-        "seven_day_opus" => (WindowKind::Custom, Some(10_080), Some("Opus · 7-day".into())),
-        "seven_day_sonnet" => (WindowKind::Custom, Some(10_080), Some("Sonnet · 7-day".into())),
-        "seven_day_oauth_apps" => {
-            (WindowKind::Custom, Some(10_080), Some("OAuth apps · 7-day".into()))
-        }
-        "seven_day_cowork" => (WindowKind::Custom, Some(10_080), Some("Cowork · 7-day".into())),
+        "seven_day_opus" => (
+            WindowKind::Custom,
+            Some(10_080),
+            Some("Opus · 7-day".into()),
+        ),
+        "seven_day_sonnet" => (
+            WindowKind::Custom,
+            Some(10_080),
+            Some("Sonnet · 7-day".into()),
+        ),
+        "seven_day_oauth_apps" => (
+            WindowKind::Custom,
+            Some(10_080),
+            Some("OAuth apps · 7-day".into()),
+        ),
+        "seven_day_cowork" => (
+            WindowKind::Custom,
+            Some(10_080),
+            Some("Cowork · 7-day".into()),
+        ),
         other => (WindowKind::Custom, None, Some(other.replace('_', " "))),
     }
 }
@@ -146,7 +160,10 @@ impl FetchStrategy for ClaudeCodeStrategy {
             method: "GET".into(),
             url: USAGE_URL.into(),
             headers: vec![
-                ("Authorization".into(), format!("Bearer {}", tokens.access_token)),
+                (
+                    "Authorization".into(),
+                    format!("Bearer {}", tokens.access_token),
+                ),
                 ("anthropic-beta".into(), OAUTH_BETA.into()),
                 ("User-Agent".into(), self.user_agent.clone()),
             ],
@@ -217,7 +234,11 @@ impl ClaudeOAuthRefresher {
     }
 
     /// Override the token endpoint / client id (env-driven config, or tests).
-    pub fn with_endpoint(mut self, token_url: impl Into<String>, client_id: impl Into<String>) -> Self {
+    pub fn with_endpoint(
+        mut self,
+        token_url: impl Into<String>,
+        client_id: impl Into<String>,
+    ) -> Self {
         self.token_url = token_url.into();
         self.client_id = client_id.into();
         self
@@ -259,7 +280,10 @@ impl ClaudeOAuthRefresher {
             })
             .await?;
         if resp.status != 200 {
-            return Err(PortError::Io(format!("token refresh failed: HTTP {}", resp.status)));
+            return Err(PortError::Io(format!(
+                "token refresh failed: HTTP {}",
+                resp.status
+            )));
         }
         parse_refresh_response(&resp.body, base, self.clock.now())
     }
@@ -386,14 +410,21 @@ mod tests {
     }
     impl FakeHttp {
         fn new(status: u16, body: &str) -> Self {
-            Self { status, body: body.into(), calls: AtomicUsize::new(0) }
+            Self {
+                status,
+                body: body.into(),
+                calls: AtomicUsize::new(0),
+            }
         }
     }
     #[async_trait]
     impl HttpPort for FakeHttp {
         async fn send(&self, _req: HttpRequest) -> Result<HttpResponse, PortError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(HttpResponse { status: self.status, body: self.body.clone().into_bytes() })
+            Ok(HttpResponse {
+                status: self.status,
+                body: self.body.clone().into_bytes(),
+            })
         }
     }
     struct FakeClock(i64);
@@ -437,7 +468,9 @@ mod tests {
             clock: Arc::new(FakeClock(1_700_000_000_000)),
             user_agent: "claude-code/test".into(),
         };
-        let ctx = FetchContext { provider: ProviderId::new("claude-code") };
+        let ctx = FetchContext {
+            provider: ProviderId::new("claude-code"),
+        };
         let snap = strat.fetch(&ctx).await.expect("fetch");
         assert_eq!(snap.provider.as_str(), "claude-code");
         assert_eq!(snap.status, Status::Ok);
@@ -453,8 +486,13 @@ mod tests {
             clock: Arc::new(FakeClock(1)),
             user_agent: "claude-code/test".into(),
         };
-        let ctx = FetchContext { provider: ProviderId::new("claude-code") };
-        assert!(matches!(strat.fetch(&ctx).await, Err(FetchError::RateLimited)));
+        let ctx = FetchContext {
+            provider: ProviderId::new("claude-code"),
+        };
+        assert!(matches!(
+            strat.fetch(&ctx).await,
+            Err(FetchError::RateLimited)
+        ));
     }
 
     // ---- refresher ----
@@ -469,7 +507,11 @@ mod tests {
         );
         let t = refresher.load().await.unwrap();
         assert_eq!(t.access_token, "old-access");
-        assert_eq!(http.calls.load(Ordering::SeqCst), 0, "must not refresh a fresh token");
+        assert_eq!(
+            http.calls.load(Ordering::SeqCst),
+            0,
+            "must not refresh a fresh token"
+        );
     }
 
     #[tokio::test]
@@ -489,7 +531,10 @@ mod tests {
         assert_eq!(t.refresh_token.as_deref(), Some("rt-new"));
         assert_eq!(t.expires_at, Some(Timestamp(1_000 + 3_600_000)));
         assert_eq!(http.calls.load(Ordering::SeqCst), 1);
-        assert!(cache.get(CACHE_KEY).unwrap().is_some(), "refreshed token must be cached");
+        assert!(
+            cache.get(CACHE_KEY).unwrap().is_some(),
+            "refreshed token must be cached"
+        );
     }
 
     #[tokio::test]
@@ -511,7 +556,9 @@ mod tests {
         let cache = Arc::new(MemSecrets::default());
         let mut cached = tokens_expiring_at(10_000_000);
         cached.access_token = "cached-fresh".into();
-        cache.set(CACHE_KEY, &serde_json::to_string(&cached).unwrap()).unwrap();
+        cache
+            .set(CACHE_KEY, &serde_json::to_string(&cached).unwrap())
+            .unwrap();
         let http = Arc::new(FakeHttp::new(200, "{}"));
         let refresher = ClaudeOAuthRefresher::new(
             Arc::new(FakeCreds(Some(tokens_expiring_at(500)))),

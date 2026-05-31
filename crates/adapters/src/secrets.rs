@@ -12,7 +12,9 @@ pub struct KeyringSecretStore {
 
 impl KeyringSecretStore {
     pub fn new(service: impl Into<String>) -> Self {
-        Self { service: service.into() }
+        Self {
+            service: service.into(),
+        }
     }
 
     fn entry(&self, key: &str) -> Result<Entry, PortError> {

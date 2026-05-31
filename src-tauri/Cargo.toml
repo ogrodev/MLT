@@ -1,9 +1,10 @@
 [package]
 name = "mlt"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "MLT — cross-platform menu-bar AI usage tracker"
+authors = ["ogrodev"]
 edition = "2021"
+publish = false
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

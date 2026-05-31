@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Linux keyring backend (sync-secret-service) build deps.
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Architecture fitness (core purity)
+        run: ./scripts/check-core-purity.sh
+      - name: Tests
+        run: cargo test --workspace
+      - name: Supply chain (cargo-deny)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+      - name: Unused deps (cargo-machete)
+        uses: bnjbvr/cargo-machete@main
+      - name: Coverage (mlt-core >= 80% lines)
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --package mlt-core --fail-under-lines 80
+
+  frontend:
+    name: Frontend gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Biome (lint + format check)
+        run: pnpm exec biome ci .
+      - name: Svelte + TypeScript check
+        run: pnpm run check
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}

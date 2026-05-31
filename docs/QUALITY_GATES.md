@@ -5,9 +5,17 @@
 > scoring harness. See [ADR 0007](./adr/0007-quality-gates.md). An optional LLM-reviewer
 > pass is a documented future add-on, not the floor.
 
-Everything here runs in CI on every PR and is reproducible locally via `make check`
-(or `just check`). A PR cannot merge unless every gate is green. Gates are *fast and
-deterministic* so they never become flaky or ignored.
+Everything here runs in CI on every PR and is reproducible locally via `make check`.
+A PR cannot merge unless every gate is green. Gates are *fast and deterministic* so they
+never become flaky or ignored.
+
+> **Status (2026-05-31): wired and green.** Implemented via `Makefile` (`make check`),
+> `.github/workflows/ci.yml` (3 jobs: Rust, Frontend, Secret-scan), `lefthook.yml`
+> (pre-commit/commit-msg/pre-push — install with `make hooks`), `deny.toml`, `biome.json`,
+> and `scripts/check-core-purity.sh`. Config files: `cargo-deny` advisories use
+> `unmaintained = "workspace"` (transitive GTK3 deps from tauri can't be fixed by us);
+> `mlt-core` line coverage floor is **80%** (currently ~86%). A Claude `PostToolUse` hook
+> (`.claude/settings.json`) auto-formats Rust on edit.
 
 ## 1. Rust gates
 

@@ -21,7 +21,9 @@ fn core_now() -> i64 {
 #[tauri::command]
 async fn fetch_claude_usage() -> Result<UsageSnapshot, String> {
     let strategy = mlt_adapters::claude_strategy();
-    let ctx = FetchContext { provider: ProviderId::new("claude-code") };
+    let ctx = FetchContext {
+        provider: ProviderId::new("claude-code"),
+    };
     strategy.fetch(&ctx).await.map_err(|e| e.to_string())
 }
 
@@ -29,7 +31,11 @@ async fn fetch_claude_usage() -> Result<UsageSnapshot, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet, core_now, fetch_claude_usage])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            core_now,
+            fetch_claude_usage
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
