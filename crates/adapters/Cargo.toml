@@ -11,6 +11,9 @@ serde_json = { workspace = true }
 # rustls keeps TLS portable (no OpenSSL/native-tls) across mac/win/linux.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 dirs = "5"
+# OS keychain for OUR secrets (refreshed tokens). macOS now; add windows-native /
+# sync-secret-service features when those CI targets come online.
+keyring = { version = "3", features = ["apple-native"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

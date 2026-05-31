@@ -8,10 +8,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use mlt_core::domain::{OAuthTokens, Timestamp};
-use mlt_core::ports::{OAuthCredentialSource, PortError};
-use mlt_core::providers::claude::ClaudeCodeStrategy;
+use mlt_core::ports::{Clock, HttpPort, OAuthCredentialSource, PortError, SecretStore};
+use mlt_core::providers::claude::{ClaudeCodeStrategy, ClaudeOAuthRefresher};
 
-use crate::{ReqwestHttp, SystemClock};
+use crate::{KeyringSecretStore, ReqwestHttp, SystemClock, KEYCHAIN_SERVICE};
 
 /// Reads Claude Code's OAuth tokens from `~/.claude/.credentials.json`, falling back to the
 /// macOS Keychain item `Claude Code-credentials`.
@@ -110,14 +110,17 @@ pub fn detect_user_agent() -> String {
     format!("claude-code/{version}")
 }
 
-/// Build a ready-to-run Claude Code strategy wired with the real adapters.
+/// Build a ready-to-run Claude Code strategy wired with the real adapters. Credentials flow
+/// through the refresher: it reuses Claude Code's live token when fresh and only refreshes
+/// (caching into OUR keychain, never Claude Code's) when that token has expired.
 pub fn claude_strategy() -> ClaudeCodeStrategy {
-    ClaudeCodeStrategy {
-        creds: Arc::new(ClaudeCredentials),
-        http: Arc::new(ReqwestHttp::new()),
-        clock: Arc::new(SystemClock),
-        user_agent: detect_user_agent(),
-    }
+    let http: Arc<dyn HttpPort> = Arc::new(ReqwestHttp::new());
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let bootstrap: Arc<dyn OAuthCredentialSource> = Arc::new(ClaudeCredentials);
+    let cache: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore::new(KEYCHAIN_SERVICE));
+    let creds: Arc<dyn OAuthCredentialSource> =
+        Arc::new(ClaudeOAuthRefresher::new(bootstrap, cache, http.clone(), clock.clone()));
+    ClaudeCodeStrategy { creds, http, clock, user_agent: detect_user_agent() }
 }
 
 #[cfg(test)]
