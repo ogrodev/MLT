@@ -11,7 +11,7 @@ CLIPPY  := "$(RUSTBIN)cargo-clippy"
 LLVM_PROFDATA := $(shell xcrun --find llvm-profdata 2>/dev/null)
 LLVM_COV      := $(shell xcrun --find llvm-cov 2>/dev/null)
 
-.PHONY: check fmt fmt-check lint test deny machete purity ui-lint ui-check coverage hooks deps
+.PHONY: check fmt fmt-check lint test deny machete purity ui-lint ui-check coverage hooks deps qa qa-release
 
 check: fmt-check lint purity test deny ui-lint ui-check ## all gates (matches CI)
 
@@ -29,3 +29,6 @@ hooks: ; lefthook install
 # Install/refresh dependencies THROUGH Socket Firewall (blocks malware at fetch, any depth).
 # Use this instead of bare `cargo fetch` / `pnpm install` when deps change.
 deps: ; pnpm exec sfw cargo fetch --locked && pnpm exec sfw pnpm install --frozen-lockfile
+# Build + install + launch the app on this Mac for manual QA (debug = fast; qa-release = real build).
+qa: ; chmod +x scripts/qa-install.sh && ./scripts/qa-install.sh debug
+qa-release: ; chmod +x scripts/qa-install.sh && ./scripts/qa-install.sh release

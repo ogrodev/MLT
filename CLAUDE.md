@@ -1,8 +1,9 @@
 # MLT — agent & contributor guide
 
 Cross-platform menu-bar/tray app: AI-provider usage tracking + alarms + read-only calendar.
-Tauri (Rust core + Svelte/SvelteKit webview), local-first. Full design in `docs/ARCHITECTURE.md`
-and `docs/adr/`; provider details in `docs/research/PROVIDERS.md`.
+Tauri (Rust core + Svelte/SvelteKit webview), local-first. Product spec + acceptance criteria
+in `docs/PRD.md`; full design in `docs/ARCHITECTURE.md` and `docs/adr/`; provider details in
+`docs/research/PROVIDERS.md`.
 
 ## Layout
 - `crates/core` — **pure** domain + ports. **Zero IO** (see invariants).
@@ -16,6 +17,8 @@ and `docs/adr/`; provider details in `docs/research/PROVIDERS.md`.
 - `make deps` — install/refresh deps **through Socket Firewall** (`sfw`), which blocks
   confirmed-malware packages at fetch (cargo + pnpm). Prefer it over bare `cargo fetch` / `pnpm install`.
 - Live Claude check: `cargo run -p mlt-adapters --example claude_live`.
+- `make qa` — build + install + launch the app on this Mac for manual QA (real menu-bar app;
+  `make qa-release` for a production-like build). Also available as the `/qa-build` skill.
 
 ## Invariants (enforced by gates — see `docs/QUALITY_GATES.md`)
 - **`crates/core` performs no IO.** No `reqwest`/`sqlx`/`keyring`/`std::fs`/`std::net`, and
