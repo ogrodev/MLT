@@ -23,6 +23,9 @@ export interface UsageSnapshot {
 
 export const fetchClaudeUsage = (): Promise<UsageSnapshot> => invoke('fetch_claude_usage');
 
+// Quit the whole app (the tray right-click menu offers the same action).
+export const quitApp = (): Promise<void> => invoke('quit');
+
 export const onUsageUpdated = (cb: (s: UsageSnapshot) => void): Promise<UnlistenFn> =>
   listen<UsageSnapshot>('usage-updated', (e) => cb(e.payload));
 

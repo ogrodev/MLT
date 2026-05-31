@@ -20,7 +20,7 @@ Each item links to its detailed requirements + acceptance criteria below.
 
 | Status | Capability | Detail |
 |--------|-----------|--------|
-| 🟡 | [Menu-bar app & popover experience](#1-menu-bar-app--popover-experience) | macOS popover built; not visually QA'd; cross-OS unverified |
+| ✅ | [Menu-bar app & popover experience](#1-menu-bar-app--popover-experience) | tray + anchored popover, quit, connected state, light/dark — QA'd on macOS install |
 | ✅ | [At-a-glance usage tracking](#2-at-a-glance-usage-tracking) | windows, %, countdowns, auto-refresh (for connected providers) |
 | 🟡 | [Provider coverage](#3-provider-coverage) | Claude Code ✅; Codex / OpenRouter / OpenAI API / Anthropic API ◻ |
 | 🟡 | [Connecting accounts: credentials & consent](#4-connecting-accounts-credentials--consent) | Claude reuse + refresh ✅; in-app connect/disconnect, API-key entry, consent UI ◻ |
