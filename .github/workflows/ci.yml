@@ -14,7 +14,7 @@ jobs:
     name: Rust gates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # System deps: tauri's GTK/WebKit stack (the app crate builds against it on Linux) +
       # the Linux keyring backend (sync-secret-service). macOS uses WKWebView so needs none.
       - run: |
@@ -53,13 +53,13 @@ jobs:
     name: Frontend gates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
         with:
           version: 10.33.0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version-file: .tool-versions
           cache: pnpm
       - name: Socket Firewall — vet dependency install (blocks malware at any depth)
         run: |
@@ -74,7 +74,7 @@ jobs:
     name: Secret scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       # gitleaks CLI (free, no license) rather than gitleaks-action@v2, which now requires a
