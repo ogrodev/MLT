@@ -6,3 +6,11 @@ description = "Concrete implementations of mlt-core ports. IO lives here, not in
 
 [dependencies]
 mlt-core = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+# rustls keeps TLS portable (no OpenSSL/native-tls) across mac/win/linux.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+dirs = "5"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

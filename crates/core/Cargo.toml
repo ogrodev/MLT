@@ -6,8 +6,16 @@ description = "MLT pure domain model and ports (no IO). See docs/adr/0006-hexago
 
 # IMPORTANT: this crate must NOT gain any IO-performing dependency (no reqwest, tokio
 # net/fs, sqlx, keyring, std::fs, SystemTime::now). All side effects enter via `ports`.
+# `serde_json` (parsing) and `time` (RFC3339 parsing ONLY — never `now`) are pure and OK.
 # This invariant is enforced by the architecture-fitness gate (docs/QUALITY_GATES.md §2).
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
+time = { version = "0.3", features = ["parsing"] }
+
+# Test-only async executor for the strategy tests (rt + macros only — NO net/fs features,
+# so the no-IO invariant holds). Production core never depends on a runtime.
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
