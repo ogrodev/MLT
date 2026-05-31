@@ -16,6 +16,11 @@ never become flaky or ignored.
 > `unmaintained = "workspace"` (transitive GTK3 deps from tauri can't be fixed by us);
 > `mlt-core` line coverage floor is **80%** (currently ~86%). A Claude `PostToolUse` hook
 > (`.claude/settings.json`) auto-formats Rust on edit.
+>
+> **Supply chain is two layers:** `cargo-deny` audits the *resolved* tree for known
+> CVEs/licenses/bans; **Socket Firewall (`sfw`)** is a real-time proxy that blocks
+> *confirmed-malware* packages at fetch/install time (cargo + pnpm), at any depth. CI wraps
+> the dependency fetch in both jobs; locally use `make deps` instead of bare installs.
 
 ## 1. Rust gates
 
@@ -28,6 +33,7 @@ never become flaky or ignored.
 | Deps: advisories | `cargo deny check advisories` | no known CVEs |
 | Deps: licenses | `cargo deny check licenses` | allowlist only (no GPL surprises) |
 | Deps: bans | `cargo deny check bans` | no duplicate/banned crates |
+| Deps: malware firewall | Socket Firewall (`sfw cargo fetch`) | block confirmed-malware crates at fetch, **any depth** |
 | Unused deps | `cargo machete` | no unused dependencies |
 | SQL correctness | `cargo sqlx prepare --check` | `.sqlx` offline cache matches schema |
 | Docs | `cargo doc --no-deps` | builds without warnings |
@@ -61,6 +67,7 @@ The hexagonal boundary is enforced by automated checks, not honor system:
 
 | Gate | Tool | Rule |
 |------|------|------|
+| Deps: malware firewall | Socket Firewall (`sfw pnpm install`) | block confirmed-malware packages at install, **any depth** |
 | Format + lint | Biome | zero issues |
 | Types | `tsc --noEmit` (strict) | no `any`, strict null checks |
 | Svelte check | `svelte-check` | no warnings |

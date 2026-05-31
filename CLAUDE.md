@@ -13,6 +13,8 @@ and `docs/adr/`; provider details in `docs/research/PROVIDERS.md`.
 ## Commands
 - `make check` — run all quality gates (matches CI). Individual: `make fmt lint test deny purity ui-lint ui-check coverage`.
 - `make hooks` — install git hooks (lefthook). `cargo test --workspace` — tests.
+- `make deps` — install/refresh deps **through Socket Firewall** (`sfw`), which blocks
+  confirmed-malware packages at fetch (cargo + pnpm). Prefer it over bare `cargo fetch` / `pnpm install`.
 - Live Claude check: `cargo run -p mlt-adapters --example claude_live`.
 
 ## Invariants (enforced by gates — see `docs/QUALITY_GATES.md`)

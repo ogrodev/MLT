@@ -33,6 +33,9 @@ importers:
       '@types/node':
         specifier: ^25.9.1
         version: 25.9.1
+      sfw:
+        specifier: ^2.0.6
+        version: 2.0.6
       svelte:
         specifier: ^5.0.0
         version: 5.56.0
@@ -686,6 +689,17 @@ packages:
   set-cookie-parser@3.1.0:
     resolution: {integrity: sha512-kjnC1DXBHcxaOaOXBHBeRtltsDG2nUiUni+jP92M9gYdW12rsmx92UsfpH7o5tDRs7I1ZZPSQJQGv3UaRfCiuw==}
 
+  sfw@2.0.6:
+    resolution: {integrity: sha512-qzAjx9DjG/gCHo+UO6S6Kd4bl0NYltnQBQzCV34BvQr0GLfvtqTWveiVI2kA2oh/yFCfe+2q60SpNj+AyUg5fQ==}
+    engines: {node: '>=20'}
+    hasBin: true
+    bundledDependencies:
+      - proper-lockfile
+      - graceful-fs
+      - retry
+      - signal-exit
+      - yocto-spinner
+
   sirv@3.0.2:
     resolution: {integrity: sha512-2wcC/oGxHis/BoHkkPwldgiPSYcpZK3JU28WoMVv55yHJgcZ8rlXvuG9iZggz+sU1d4bRgIGASwyWqjxu3FM0g==}
     engines: {node: '>=18'}
@@ -1233,6 +1247,8 @@ snapshots:
       mri: 1.2.0
 
   set-cookie-parser@3.1.0: {}
+
+  sfw@2.0.6: {}
 
   sirv@3.0.2:
     dependencies:

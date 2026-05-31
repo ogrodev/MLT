@@ -27,6 +27,10 @@ jobs:
         with:
           components: rustfmt, clippy, llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
+      - name: Socket Firewall — vet crate fetch (blocks malware at any depth)
+        run: |
+          npm i -g sfw
+          sfw cargo fetch --locked
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy (deny warnings)
@@ -57,7 +61,10 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - name: Socket Firewall — vet dependency install (blocks malware at any depth)
+        run: |
+          npm i -g sfw
+          sfw pnpm install --frozen-lockfile
       - name: Biome (lint + format check)
         run: pnpm exec biome ci .
       - name: Svelte + TypeScript check
