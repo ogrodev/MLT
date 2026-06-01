@@ -8,7 +8,9 @@
 pub mod domain;
 pub mod ports;
 pub mod providers;
+pub mod sources;
 
 pub use domain::*;
 pub use ports::*;
 pub use providers::*;
+pub use sources::*;

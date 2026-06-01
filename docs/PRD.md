@@ -23,12 +23,12 @@ Each item links to its detailed requirements + acceptance criteria below.
 | ✅ | [Menu-bar app & popover experience](#1-menu-bar-app--popover-experience) | tray + anchored popover, quit, connected state, light/dark — QA'd on macOS install |
 | ✅ | [At-a-glance usage tracking](#2-at-a-glance-usage-tracking) | windows, %, countdowns, auto-refresh (for connected providers) |
 | 🟡 | [Provider coverage](#3-provider-coverage) | Claude Code ✅; Codex / OpenRouter / OpenAI API / Anthropic API ◻ |
-| 🟡 | [Connecting accounts: credentials & consent](#4-connecting-accounts-credentials--consent) | Claude reuse + refresh ✅; in-app connect/disconnect, API-key entry, consent UI ◻ |
+| 🟡 | [Connecting accounts: credentials & consent](#4-connecting-accounts-credentials--consent) | Claude reuse + refresh ✅; source discovery + per-source consent UI ✅; API-key entry, disconnect ◻ |
 | ◻ | [Alarms & notifications](#5-alarms--notifications) | threshold + user-defined alarms → OS notifications |
 | ◻ | [Calendar awareness (read-only)](#6-calendar-awareness-read-only) | Google / Outlook / Apple calendars |
 | 🟡 | [Reliability & always-on](#7-reliability--always-on) | resilience + refresh loop ✅; login-item + wake catch-up ◻ |
 | 🟡 | [Cross-platform support](#8-cross-platform-support) | compiles for Linux in CI; only run/verified on macOS |
-| 🟡 | [Privacy & security](#9-privacy--security) | local-only + keychain ✅; consent surfacing + telemetry choice ◻ |
+| 🟡 | [Privacy & security](#9-privacy--security) | local-only + keychain ✅; metadata-only discovery + consent surfacing ✅; telemetry choice ◻ |
 | ◻ | [Distribution & updates](#10-distribution--updates) | signing, notarization, installers, auto-update |
 | 🟡 | [Quality, CI & release readiness](#11-quality-ci--release-readiness) | **full CI suite green ✅**; signed-release pipeline ◻ |
 | ✅ | [Manual QA & installability](#12-manual-qa--installability) | one-command build + install on macOS (`make qa`) |

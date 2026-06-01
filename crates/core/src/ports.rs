@@ -46,6 +46,23 @@ pub trait OAuthCredentialSource: Send + Sync {
     async fn load(&self) -> Result<OAuthTokens, PortError>;
 }
 
+/// Metadata-only presence detection for a discoverable local source (ADR 0012). An
+/// implementation MUST decide presence from **existence alone** — a credentials file on
+/// disk, a Keychain item being present — and MUST NOT read, decrypt, or parse any secret.
+/// Returning `true` means "a login for this source exists here", never that it was read.
+#[async_trait]
+pub trait SourceProbe: Send + Sync {
+    async fn is_present(&self, id: &ProviderId) -> bool;
+}
+
+/// Persists the user's per-source opt-in. Consent is **not** a secret, so it lives here —
+/// a plain settings store — never in the keychain (ADR 0012). A source with no stored
+/// entry is treated as **disabled**: nothing is read until the user explicitly opts in.
+pub trait ConsentStore: Send + Sync {
+    fn is_enabled(&self, id: &ProviderId) -> Result<bool, PortError>;
+    fn set_enabled(&self, id: &ProviderId, enabled: bool) -> Result<(), PortError>;
+}
+
 #[async_trait]
 pub trait UsageRepo: Send + Sync {
     async fn save(&self, snapshot: &UsageSnapshot) -> Result<(), PortError>;
