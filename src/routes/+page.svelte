@@ -12,6 +12,7 @@ import {
   type UsageSnapshot,
   type UsageWindow,
 } from '$lib/usage';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 
 let snapshot = $state<UsageSnapshot | null>(null);
 let error = $state<string | null>(null);
@@ -133,6 +134,21 @@ onMount(() => {
     loading = false;
   }).then((u) => unlisteners.push(u));
 
+  // Re-discover whenever the popover regains focus (i.e. each time it's opened), so presence
+  // reflects logins/logouts that happened since the webview loaded — `sources` is otherwise
+  // only fetched once. Passive refresh: swallow errors so it can't clobber the usage state.
+  getCurrentWindow()
+    .onFocusChanged(({ payload: focused }) => {
+      if (focused) {
+        listSources()
+          .then((s) => {
+            sources = s;
+          })
+          .catch(() => {});
+      }
+    })
+    .then((u) => unlisteners.push(u));
+
   const tick = setInterval(() => {
     now = Date.now();
   }, 1000);
@@ -182,6 +198,7 @@ onMount(() => {
       </p>
       <ul class="space-y-3">
         {#each sources as s (s.id)}
+          {@const canToggle = s.present || s.enabled}
           <li class="rounded-lg border border-neutral-200 p-3 dark:border-neutral-800">
             <div class="flex items-start justify-between gap-3">
               <div class="flex items-center gap-2">
@@ -197,7 +214,7 @@ onMount(() => {
                 </span>
               </div>
               <label
-                class="relative inline-flex shrink-0 items-center {s.present
+                class="relative inline-flex shrink-0 items-center {canToggle
                   ? 'cursor-pointer'
                   : 'cursor-not-allowed opacity-40'}"
               >
@@ -205,7 +222,7 @@ onMount(() => {
                   type="checkbox"
                   class="peer sr-only"
                   checked={s.enabled}
-                  disabled={!s.present}
+                  disabled={!canToggle}
                   onchange={(e) => toggleSource(s, e.currentTarget.checked)}
                 />
                 <span class="sr-only">Enable {s.display_name}</span>
@@ -220,9 +237,13 @@ onMount(() => {
             <p class="mt-2 text-[11px] leading-relaxed text-neutral-500 dark:text-neutral-400">
               {s.access_note}
             </p>
-            {#if !s.present}
+            {#if !s.present && !s.enabled}
               <p class="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">
                 Log in to {s.display_name} on this Mac, then it'll appear here.
+              </p>
+            {:else if !s.present}
+              <p class="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">
+                Not detected right now — turn off to revoke; it resumes if detected again.
               </p>
             {/if}
           </li>

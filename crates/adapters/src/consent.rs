@@ -50,8 +50,22 @@ impl ConsentStore for FileConsentStore {
 
     fn set_enabled(&self, id: &ProviderId, enabled: bool) -> Result<(), PortError> {
         let mut map = self.state.lock();
-        map.insert(id.as_str().to_string(), enabled);
-        self.persist(&map)
+        let previous = map.insert(id.as_str().to_string(), enabled);
+        if let Err(e) = self.persist(&map) {
+            // Persist failed — undo the in-memory change so runtime consent never diverges
+            // from disk. Fail closed: a source is only ever treated as opted-in once that
+            // choice has been durably recorded.
+            match previous {
+                Some(prev) => {
+                    map.insert(id.as_str().to_string(), prev);
+                }
+                None => {
+                    map.remove(id.as_str());
+                }
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 }
 
@@ -108,5 +122,28 @@ mod tests {
         assert!(!store.is_enabled(&ProviderId::new("b")).unwrap());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_persist_leaves_runtime_consent_unchanged() {
+        let dir = std::env::temp_dir().join(format!(
+            "mlt-consent-test-{}-failclosed",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Put a *file* where the consent dir's parent should be, so `create_dir_all` (and
+        // therefore `persist`) fails deterministically — no real disk fault needed.
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let store = FileConsentStore::load(blocker.join("consent.json"));
+        let id = ProviderId::new("claude-code");
+
+        assert!(store.set_enabled(&id, true).is_err(), "persist must fail");
+        // The opt-in must NOT have taken effect in memory: disk and runtime stay in lockstep,
+        // so a source is never read on the strength of a write that never landed.
+        assert!(!store.is_enabled(&id).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
