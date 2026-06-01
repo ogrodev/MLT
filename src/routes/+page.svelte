@@ -89,8 +89,10 @@ async function toggleSource(source: SourceState, enabled: boolean): Promise<void
   try {
     sources = await setSourceEnabled(source.id, enabled);
     error = null;
-    if (enabled && source.present) {
-      loading = true; // awaiting the backend's kick-off fetch
+    if (enabled && source.present && !snapshot) {
+      // Awaiting the backend's kick-off fetch — unless a usage event already raced in and
+      // populated the snapshot, in which case flipping to "loading" would mask live data.
+      loading = true;
     } else if (!sources.some((s) => s.present && s.enabled)) {
       snapshot = null; // nothing connected anymore — drop the disconnected usage
       loading = false;
