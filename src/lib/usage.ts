@@ -21,10 +21,28 @@ export interface UsageSnapshot {
   fetched_at: number; // unix ms
 }
 
+// A row of the connect/sources screen (mirrors mlt-core's `SourceState`). `present` is
+// metadata-only discovery; `enabled` is the user's opt-in. The app reads a source's
+// credentials only when both are true.
+export interface SourceState {
+  id: string;
+  display_name: string;
+  access_note: string;
+  present: boolean;
+  enabled: boolean;
+}
+
 export const fetchClaudeUsage = (): Promise<UsageSnapshot> => invoke('fetch_claude_usage');
 
 // Quit the whole app (the tray right-click menu offers the same action).
 export const quitApp = (): Promise<void> => invoke('quit');
+
+// Discover local sources (presence + consent). Reads no secret.
+export const listSources = (): Promise<SourceState[]> => invoke('list_sources');
+
+// Opt a source in/out. Takes effect immediately; returns the refreshed source list.
+export const setSourceEnabled = (id: string, enabled: boolean): Promise<SourceState[]> =>
+  invoke('set_source_enabled', { id, enabled });
 
 export const onUsageUpdated = (cb: (s: UsageSnapshot) => void): Promise<UnlistenFn> =>
   listen<UsageSnapshot>('usage-updated', (e) => cb(e.payload));

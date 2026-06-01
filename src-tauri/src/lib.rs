@@ -1,9 +1,12 @@
 // MLT app crate: tray + chromeless popover, wired to the provider slice in mlt-adapters.
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use mlt_adapters::{FileConsentStore, LocalSourceProbe};
 use mlt_core::domain::{ProviderId, UsageSnapshot};
+use mlt_core::ports::{ConsentStore, SourceProbe};
 use mlt_core::providers::{FetchContext, FetchStrategy};
+use mlt_core::sources::{active_sources, discover_sources, source_catalog, SourceState};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
@@ -32,6 +35,14 @@ struct PopoverState {
     last_focus_hide: Mutex<Option<Instant>>,
 }
 
+/// Discovery + consent wiring shared by the source commands and the refresh loop. Holds the
+/// metadata-only presence probe and the persisted per-source opt-in (ADR 0012); nothing here
+/// reads a secret until [`active_sources`] clears a source for fetching.
+struct AppSources {
+    probe: Arc<dyn SourceProbe>,
+    consent: Arc<dyn ConsentStore>,
+}
+
 /// Pure decision for a tray left-click, isolated from Tauri so it is unit-testable.
 ///
 /// Dismissing an open popover by clicking the tray icon first fires a focus-loss that hides
@@ -53,9 +64,66 @@ fn popover_action(
 }
 
 /// Fetch the current Claude Code subscription usage on demand (called by the UI on open).
+/// Gated on consent: the secret is read only when the source is opted in *and* present, so a
+/// stray call can never read credentials the user hasn't connected (ADR 0012).
 #[tauri::command]
-async fn fetch_claude_usage() -> Result<UsageSnapshot, String> {
+async fn fetch_claude_usage(
+    sources: tauri::State<'_, AppSources>,
+) -> Result<UsageSnapshot, String> {
+    let id = ProviderId::new("claude-code");
+    let connected = sources.consent.is_enabled(&id).map_err(|e| e.to_string())?
+        && sources.probe.is_present(&id).await;
+    if !connected {
+        return Err("Claude Code is not connected".into());
+    }
     claude_usage().await.map_err(|e| e.to_string())
+}
+
+/// Discover every known source for the connect screen: presence (metadata only) + the user's
+/// stored opt-in. Reads no secret.
+#[tauri::command]
+async fn list_sources(sources: tauri::State<'_, AppSources>) -> Result<Vec<SourceState>, String> {
+    discover_sources(
+        &source_catalog(),
+        sources.probe.as_ref(),
+        sources.consent.as_ref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Enable or disable a source. Takes effect immediately and without a restart: the choice is
+/// persisted, and opting in kicks an off-thread refresh so the popover fills in right away
+/// (rather than waiting for the next poll). Returns the refreshed source list for the UI.
+#[tauri::command]
+async fn set_source_enabled(
+    app: tauri::AppHandle,
+    sources: tauri::State<'_, AppSources>,
+    id: String,
+    enabled: bool,
+) -> Result<Vec<SourceState>, String> {
+    let id = ProviderId::new(id);
+    sources
+        .consent
+        .set_enabled(&id, enabled)
+        .map_err(|e| e.to_string())?;
+
+    if enabled {
+        let app = app.clone();
+        let probe = sources.probe.clone();
+        let consent = sources.consent.clone();
+        tauri::async_runtime::spawn(async move {
+            refresh_active(&app, probe.as_ref(), consent.as_ref()).await;
+        });
+    }
+
+    discover_sources(
+        &source_catalog(),
+        sources.probe.as_ref(),
+        sources.consent.as_ref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Quit the whole app. Both the popover footer and the tray menu route here.
@@ -72,19 +140,52 @@ async fn claude_usage() -> Result<UsageSnapshot, mlt_core::providers::FetchError
     strategy.fetch(&ctx).await
 }
 
-/// Background poll loop: refresh usage on a cadence and emit events the popover listens to.
-fn spawn_refresh_loop(app: tauri::AppHandle) {
+/// Fetch one source's usage, or `None` for a source with no fetch wired yet. The map of
+/// id → fetcher is the single place a connected source becomes a network call.
+async fn fetch_for(
+    id: &ProviderId,
+) -> Option<Result<UsageSnapshot, mlt_core::providers::FetchError>> {
+    match id.as_str() {
+        "claude-code" => Some(claude_usage().await),
+        _ => None,
+    }
+}
+
+/// Refresh every *active* source (opted-in and present) and emit the result for the popover.
+/// Disabled or absent sources are skipped here, so no secret is read for them — this is the
+/// consent gate the whole refresh path funnels through.
+async fn refresh_active(
+    app: &tauri::AppHandle,
+    probe: &dyn SourceProbe,
+    consent: &dyn ConsentStore,
+) {
+    let Ok(ids) = active_sources(&source_catalog(), probe, consent).await else {
+        return;
+    };
+    for id in &ids {
+        match fetch_for(id).await {
+            Some(Ok(snapshot)) => {
+                let _ = app.emit("usage-updated", snapshot);
+            }
+            Some(Err(e)) => {
+                let _ = app.emit("usage-error", e.to_string());
+            }
+            None => {}
+        }
+    }
+}
+
+/// Background poll loop: refresh the active sources on a cadence and emit events the popover
+/// listens to. Runs once immediately so a previously-connected source shows up at launch.
+fn spawn_refresh_loop(
+    app: tauri::AppHandle,
+    probe: Arc<dyn SourceProbe>,
+    consent: Arc<dyn ConsentStore>,
+) {
     tauri::async_runtime::spawn(async move {
         loop {
-            match claude_usage().await {
-                Ok(snapshot) => {
-                    let _ = app.emit("usage-updated", snapshot);
-                }
-                Err(e) => {
-                    let _ = app.emit("usage-error", e.to_string());
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(REFRESH_SECS)).await;
+            refresh_active(&app, probe.as_ref(), consent.as_ref()).await;
+            tokio::time::sleep(Duration::from_secs(REFRESH_SECS)).await;
         }
     });
 }
@@ -130,7 +231,12 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_positioner::init())
         .manage(PopoverState::default())
-        .invoke_handler(tauri::generate_handler![fetch_claude_usage, quit])
+        .invoke_handler(tauri::generate_handler![
+            fetch_claude_usage,
+            list_sources,
+            set_source_enabled,
+            quit
+        ])
         .setup(|app| {
             // Menu-bar app: no Dock icon / app-switcher entry on macOS.
             #[cfg(target_os = "macos")]
@@ -178,7 +284,19 @@ pub fn run() {
                 });
             }
 
-            spawn_refresh_loop(app.handle().clone());
+            // Discovery + consent: a metadata-only presence probe and the persisted opt-in.
+            // Consent lives in a plain JSON settings file (never the keychain), so it survives
+            // restarts; presence is re-checked each poll so a source appears as soon as the
+            // user logs into it. Both are shared with the source commands via managed state.
+            let consent_path = app.path().app_config_dir()?.join("consent.json");
+            let probe: Arc<dyn SourceProbe> = Arc::new(LocalSourceProbe);
+            let consent: Arc<dyn ConsentStore> = Arc::new(FileConsentStore::load(consent_path));
+            app.manage(AppSources {
+                probe: probe.clone(),
+                consent: consent.clone(),
+            });
+
+            spawn_refresh_loop(app.handle().clone(), probe, consent);
             Ok(())
         })
         .run(tauri::generate_context!())

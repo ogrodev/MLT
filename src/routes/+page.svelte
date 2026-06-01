@@ -2,18 +2,24 @@
 import { onMount } from 'svelte';
 import {
   fetchClaudeUsage,
+  listSources,
   onUsageError,
   onUsageUpdated,
   quitApp,
+  setSourceEnabled,
+  type SourceState,
   type Status,
   type UsageSnapshot,
   type UsageWindow,
 } from '$lib/usage';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 
 let snapshot = $state<UsageSnapshot | null>(null);
 let error = $state<string | null>(null);
 let loading = $state(true);
 let now = $state(Date.now());
+let sources = $state<SourceState[]>([]);
+let view = $state<'usage' | 'sources'>('usage');
 
 const KIND_LABEL: Record<UsageWindow['kind'], string> = {
   Session: 'Session',
@@ -24,8 +30,8 @@ const KIND_LABEL: Record<UsageWindow['kind'], string> = {
 
 type Tone = 'ok' | 'warn' | 'err' | 'idle';
 
-// Connected-state indicator. Always shows *something*: connecting before the first fetch,
-// the provider's freshness once we have data, and a clear disconnected state on hard failure.
+// Connected-state indicator. Always shows *something*: not-connected before any opt-in,
+// connecting before the first fetch, the provider's freshness once we have data.
 const TONE: Record<Tone, string> = {
   ok: 'text-emerald-600 dark:text-emerald-400',
   warn: 'text-amber-600 dark:text-amber-400',
@@ -38,12 +44,17 @@ const STATUS_CONN: Record<Status, { label: string; tone: Tone }> = {
   Error: { label: 'Error', tone: 'err' },
 };
 
+// A source is "connected" only when discovered *and* opted in (the consent gate).
+const anyActive = $derived(sources.some((s) => s.present && s.enabled));
+
 const conn = $derived(
-  snapshot
-    ? STATUS_CONN[snapshot.status]
-    : error
-      ? { label: 'Disconnected', tone: 'err' as Tone }
-      : { label: 'Connecting…', tone: 'idle' as Tone },
+  !anyActive
+    ? { label: 'Not connected', tone: 'idle' as Tone }
+    : snapshot
+      ? STATUS_CONN[snapshot.status]
+      : error
+        ? { label: 'Disconnected', tone: 'err' as Tone }
+        : { label: 'Connecting…', tone: 'idle' as Tone },
 );
 
 function label(w: UsageWindow): string {
@@ -73,13 +84,38 @@ function lastUpdated(ms: number): string {
   return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
+// Opt a source in/out. The backend persists the choice and, on opt-in, kicks an immediate
+// fetch (a `usage-updated`/`usage-error` event), so the popover updates without a restart.
+async function toggleSource(source: SourceState, enabled: boolean): Promise<void> {
+  try {
+    sources = await setSourceEnabled(source.id, enabled);
+    error = null;
+    if (enabled && source.present && !snapshot) {
+      // Awaiting the backend's kick-off fetch — unless a usage event already raced in and
+      // populated the snapshot, in which case flipping to "loading" would mask live data.
+      loading = true;
+    } else if (!sources.some((s) => s.present && s.enabled)) {
+      snapshot = null; // nothing connected anymore — drop the disconnected usage
+      loading = false;
+    }
+  } catch (e) {
+    error = String(e);
+  }
+}
+
 onMount(() => {
   const unlisteners: Array<() => void> = [];
 
-  fetchClaudeUsage()
-    .then((s) => {
-      snapshot = s;
-      error = null;
+  listSources()
+    .then((discovered) => {
+      sources = discovered;
+      // Only read a credential when a source is actually connected.
+      if (discovered.some((s) => s.present && s.enabled)) {
+        return fetchClaudeUsage().then((s) => {
+          snapshot = s;
+          error = null;
+        });
+      }
     })
     .catch((e) => {
       error = String(e);
@@ -95,7 +131,23 @@ onMount(() => {
   }).then((u) => unlisteners.push(u));
   onUsageError((msg) => {
     error = msg;
+    loading = false;
   }).then((u) => unlisteners.push(u));
+
+  // Re-discover whenever the popover regains focus (i.e. each time it's opened), so presence
+  // reflects logins/logouts that happened since the webview loaded — `sources` is otherwise
+  // only fetched once. Passive refresh: swallow errors so it can't clobber the usage state.
+  getCurrentWindow()
+    .onFocusChanged(({ payload: focused }) => {
+      if (focused) {
+        listSources()
+          .then((s) => {
+            sources = s;
+          })
+          .catch(() => {});
+      }
+    })
+    .then((u) => unlisteners.push(u));
 
   const tick = setInterval(() => {
     now = Date.now();
@@ -114,12 +166,104 @@ onMount(() => {
   <header
     class="flex items-center justify-between border-b border-neutral-200 px-4 py-3 dark:border-neutral-800"
   >
-    <h1 class="text-sm font-semibold tracking-tight">Claude Code</h1>
-    <span class="text-[11px] {TONE[conn.tone]}">● {conn.label}</span>
+    {#if view === 'sources'}
+      <h1 class="text-sm font-semibold tracking-tight">Sources</h1>
+      <button
+        type="button"
+        onclick={() => (view = 'usage')}
+        class="rounded px-2 py-0.5 text-[11px] text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+      >
+        Done
+      </button>
+    {:else}
+      <h1 class="text-sm font-semibold tracking-tight">Claude Code</h1>
+      <div class="flex items-center gap-2">
+        <button
+          type="button"
+          onclick={() => (view = 'sources')}
+          class="rounded px-2 py-0.5 text-[11px] text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+        >
+          Sources
+        </button>
+        <span class="text-[11px] {TONE[conn.tone]}">● {conn.label}</span>
+      </div>
+    {/if}
   </header>
 
   <section class="flex-1 overflow-y-auto px-4 py-3">
-    {#if loading}
+    {#if view === 'sources'}
+      <p class="mb-3 text-[11px] text-neutral-500 dark:text-neutral-400">
+        MLT only reads a source after you turn it on. Discovery checks what's installed — it
+        never reads a credential until you opt in.
+      </p>
+      <ul class="space-y-3">
+        {#each sources as s (s.id)}
+          {@const canToggle = s.present || s.enabled}
+          <li class="rounded-lg border border-neutral-200 p-3 dark:border-neutral-800">
+            <div class="flex items-start justify-between gap-3">
+              <div class="flex items-center gap-2">
+                <span class="text-[13px] font-medium text-neutral-800 dark:text-neutral-200"
+                  >{s.display_name}</span
+                >
+                <span
+                  class="rounded-full px-1.5 py-0.5 text-[10px] font-medium {s.present
+                    ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300'
+                    : 'bg-neutral-100 text-neutral-500 dark:bg-neutral-800 dark:text-neutral-400'}"
+                >
+                  {s.present ? 'Detected' : 'Not detected'}
+                </span>
+              </div>
+              <label
+                class="relative inline-flex shrink-0 items-center {canToggle
+                  ? 'cursor-pointer'
+                  : 'cursor-not-allowed opacity-40'}"
+              >
+                <input
+                  type="checkbox"
+                  class="peer sr-only"
+                  checked={s.enabled}
+                  disabled={!canToggle}
+                  onchange={(e) => toggleSource(s, e.currentTarget.checked)}
+                />
+                <span class="sr-only">Enable {s.display_name}</span>
+                <span
+                  class="block h-5 w-9 rounded-full bg-neutral-300 transition-colors peer-checked:bg-emerald-500 peer-focus-visible:ring-2 peer-focus-visible:ring-emerald-500/50 dark:bg-neutral-700"
+                ></span>
+                <span
+                  class="pointer-events-none absolute top-0.5 left-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform peer-checked:translate-x-4"
+                ></span>
+              </label>
+            </div>
+            <p class="mt-2 text-[11px] leading-relaxed text-neutral-500 dark:text-neutral-400">
+              {s.access_note}
+            </p>
+            {#if !s.present && !s.enabled}
+              <p class="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">
+                Log in to {s.display_name} on this Mac, then it'll appear here.
+              </p>
+            {:else if !s.present}
+              <p class="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">
+                Not detected right now — turn off to revoke; it resumes if detected again.
+              </p>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    {:else if !anyActive}
+      <div class="mt-8 text-center">
+        <p class="text-sm text-neutral-700 dark:text-neutral-300">No sources connected</p>
+        <p class="mt-2 text-[11px] text-neutral-500 dark:text-neutral-400">
+          Choose what MLT may read to track your AI usage. Nothing is read until you opt in.
+        </p>
+        <button
+          type="button"
+          onclick={() => (view = 'sources')}
+          class="mt-4 rounded-md bg-neutral-900 px-3 py-1.5 text-[12px] font-medium text-white transition-colors hover:bg-neutral-700 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-neutral-300"
+        >
+          Choose sources
+        </button>
+      </div>
+    {:else if loading}
       <p class="mt-10 text-center text-sm text-neutral-500 dark:text-neutral-400">Loading usage…</p>
     {:else if error && !snapshot}
       <div class="mt-8 text-center">

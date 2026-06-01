@@ -3,6 +3,7 @@
 //! Reuses the Claude Code CLI's existing OAuth login (ADR 0012, metadata-only discovery →
 //! per-source opt-in applies at the app layer). Order: the plain file first, then the macOS
 //! Keychain (which may prompt the user the first time).
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -17,6 +18,33 @@ use crate::{KeyringSecretStore, ReqwestHttp, SystemClock, KEYCHAIN_SERVICE};
 /// macOS Keychain item `Claude Code-credentials`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ClaudeCredentials;
+
+impl ClaudeCredentials {
+    /// Metadata-only presence check (ADR 0012): does a Claude Code login *exist* on this
+    /// machine? Checks the credentials file's existence and the Keychain item's presence — it
+    /// never opens, decrypts, or parses the token. This is the discovery path: the secret is
+    /// only read later via [`OAuthCredentialSource::load`], after the user opts the source in.
+    pub fn is_present() -> bool {
+        file_present() || keychain_present()
+    }
+}
+
+/// Claude Code's plaintext credentials file under a given home dir. Split out so presence can
+/// be unit-tested against a temp home without reading anything.
+fn credentials_path(home: &Path) -> PathBuf {
+    home.join(".claude/.credentials.json")
+}
+
+/// Does the credentials file *exist*? `is_file` is a stat — it never opens the file, so even a
+/// present-but-garbage file counts as "a login exists here", which is exactly what proves
+/// discovery is decoupled from reading the secret.
+fn path_present(home: &Path) -> bool {
+    credentials_path(home).is_file()
+}
+
+fn file_present() -> bool {
+    dirs::home_dir().map(|h| path_present(&h)).unwrap_or(false)
+}
 
 #[async_trait]
 impl OAuthCredentialSource for ClaudeCredentials {
@@ -111,6 +139,24 @@ fn read_keychain() -> Option<String> {
     None
 }
 
+/// Does the macOS Keychain hold Claude Code's credential item? Runs `find-generic-password`
+/// **without `-w`**, so it returns only the item's attributes (exit 0 if present) and never the
+/// password — presence only, no secret read (ADR 0012). Contrast [`read_keychain`], which
+/// passes `-w` to read the token and runs only on the consented `load` path.
+#[cfg(target_os = "macos")]
+fn keychain_present() -> bool {
+    std::process::Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", "Claude Code-credentials"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_present() -> bool {
+    false
+}
+
 /// Best-effort detection of the installed Claude Code CLI version for the required
 /// `User-Agent: claude-code/<version>` header (without it, the endpoint 429s hard).
 pub fn detect_user_agent() -> String {
@@ -167,5 +213,30 @@ mod tests {
     #[test]
     fn detect_user_agent_has_the_claude_code_prefix() {
         assert!(detect_user_agent().starts_with("claude-code/"));
+    }
+
+    #[test]
+    fn presence_is_metadata_only_and_never_reads_the_secret() {
+        let base = std::env::temp_dir().join(format!("mlt-presence-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // No credentials file ⇒ not present.
+        assert!(
+            !path_present(&base),
+            "absent credentials file ⇒ not present"
+        );
+
+        std::fs::create_dir_all(base.join(".claude")).unwrap();
+        // Deliberately INVALID content: discovery reports "present" from existence alone,
+        // while the real secret path (`parse_creds`) rejects it — proof the probe never reads
+        // or parses the credential it discovered.
+        std::fs::write(credentials_path(&base), "not a real credential").unwrap();
+        assert!(path_present(&base), "existing file ⇒ present (stat only)");
+        assert!(
+            parse_creds("not a real credential").is_err(),
+            "the secret-reading path would reject this content"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
