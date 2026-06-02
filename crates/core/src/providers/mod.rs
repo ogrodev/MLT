@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 pub mod claude;
+pub mod openrouter;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchKind {

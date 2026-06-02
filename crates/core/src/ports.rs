@@ -63,6 +63,26 @@ pub trait ConsentStore: Send + Sync {
     fn set_enabled(&self, id: &ProviderId, enabled: bool) -> Result<(), PortError>;
 }
 
+/// Persists an optional, user-assigned custom name per source — shown as the panel *title*,
+/// distinct from the provider's own `display_name` (which it never replaces) and from the
+/// auto-fetched account identity. Not a secret and not consent — a plain UI preference stored
+/// alongside consent, never in the keychain. `None` means "no custom name".
+pub trait SourceLabels: Send + Sync {
+    fn label(&self, id: &ProviderId) -> Result<Option<String>, PortError>;
+    /// Set the label, or clear it with `None`.
+    fn set_label(&self, id: &ProviderId, label: Option<&str>) -> Result<(), PortError>;
+}
+
+/// Caches the account identity (email/org) resolved from a provider, per source. Identity is
+/// account-identifying **display** metadata — not a secret and not consent — so, like consent
+/// and labels, it lives in a plain settings store, never the keychain. Caching it lets us
+/// resolve a provider's identity once instead of on every poll (sparing rate-limited usage
+/// endpoints). A missing entry means "not resolved yet".
+pub trait IdentityStore: Send + Sync {
+    fn identity(&self, id: &ProviderId) -> Result<Option<AccountIdentity>, PortError>;
+    fn set_identity(&self, id: &ProviderId, identity: &AccountIdentity) -> Result<(), PortError>;
+}
+
 #[async_trait]
 pub trait UsageRepo: Send + Sync {
     async fn save(&self, snapshot: &UsageSnapshot) -> Result<(), PortError>;

@@ -14,6 +14,9 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+/// Account profile (email/org) for the OAuth login — read with the same token, used only to
+/// show *which* account the panel reports. Verified to exist (401 without a token, not 404).
+pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 const REQUIRED_SCOPE: &str = "user:profile";
 
@@ -127,6 +130,62 @@ fn parse_extra_usage(val: &serde_json::Value) -> Option<UsageWindow> {
     })
 }
 
+/// Pure, lossy parser for the OAuth profile body. Identity is account-identifying display
+/// metadata, not a secret: we read the account email and organization name. Any shape we
+/// don't recognize yields an empty identity rather than an error (ADR 0015) — identity is
+/// best-effort, never load-bearing.
+fn parse_profile(body: &[u8]) -> AccountIdentity {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return AccountIdentity::default();
+    };
+    let pick = |val: Option<&serde_json::Value>| {
+        val.and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    let email = pick(
+        v.pointer("/account/email_address")
+            .or_else(|| v.pointer("/account/email"))
+            .or_else(|| v.get("email_address"))
+            .or_else(|| v.get("email")),
+    );
+    let organization = pick(
+        v.pointer("/organization/name")
+            .or_else(|| v.get("organization_name")),
+    );
+    AccountIdentity {
+        email,
+        organization,
+    }
+}
+
+/// Best-effort fetch of the Claude account profile (email/org) for display, using the same
+/// OAuth token as the usage call. Never fatal: any failure — transport, non-200, unparseable,
+/// or an empty profile — yields `None`, so identity never blocks or breaks a usage fetch.
+async fn fetch_identity(
+    http: &dyn HttpPort,
+    access_token: &str,
+    user_agent: &str,
+) -> Option<AccountIdentity> {
+    let req = HttpRequest {
+        method: "GET".into(),
+        url: PROFILE_URL.into(),
+        headers: vec![
+            ("Authorization".into(), format!("Bearer {access_token}")),
+            ("anthropic-beta".into(), OAUTH_BETA.into()),
+            ("User-Agent".into(), user_agent.into()),
+        ],
+        body: None,
+    };
+    let resp = http.send(req).await.ok()?;
+    if resp.status != 200 {
+        return None;
+    }
+    let identity = parse_profile(&resp.body);
+    (!identity.is_empty()).then_some(identity)
+}
+
 /// The OAuth strategy for Claude Code: read the CLI's token, poll `api/oauth/usage`.
 pub struct ClaudeCodeStrategy {
     pub creds: Arc<dyn OAuthCredentialSource>,
@@ -135,6 +194,9 @@ pub struct ClaudeCodeStrategy {
     /// e.g. `"claude-code/2.1.158"`. REQUIRED — without the claude-code UA the endpoint
     /// rate-limits hard (persistent 429). See docs/research/PROVIDERS.md.
     pub user_agent: String,
+    /// Caches the resolved account identity so the profile is fetched at most once, not on
+    /// every poll — keeping the extra request off the rate-limited usage endpoint's back.
+    pub identity: Arc<dyn IdentityStore>,
 }
 
 #[async_trait]
@@ -174,11 +236,13 @@ impl FetchStrategy for ClaudeCodeStrategy {
             200 => {
                 let body = String::from_utf8_lossy(&resp.body);
                 let windows = parse_usage(&body)?;
+                let account = self.resolve_identity(ctx, &tokens.access_token).await;
                 Ok(UsageSnapshot {
                     provider: ctx.provider.clone(),
                     windows,
                     status: Status::Ok,
                     fetched_at: self.clock.now(),
+                    account,
                 })
             }
             429 => Err(FetchError::RateLimited),
@@ -188,6 +252,25 @@ impl FetchStrategy for ClaudeCodeStrategy {
 
     fn should_fallback(&self, err: &FetchError) -> bool {
         matches!(err, FetchError::Unavailable)
+    }
+}
+
+impl ClaudeCodeStrategy {
+    /// The account identity for a snapshot: the cached value if present, otherwise a one-shot
+    /// best-effort profile fetch that is then cached. Fetched at most once per account — later
+    /// polls hit the cache — so identity adds no recurring load to the usage endpoint. Any
+    /// failure leaves identity `None` and never affects the usage result.
+    async fn resolve_identity(
+        &self,
+        ctx: &FetchContext,
+        access_token: &str,
+    ) -> Option<AccountIdentity> {
+        if let Ok(Some(cached)) = self.identity.identity(&ctx.provider) {
+            return Some(cached);
+        }
+        let fetched = fetch_identity(self.http.as_ref(), access_token, &self.user_agent).await?;
+        let _ = self.identity.set_identity(&ctx.provider, &fetched);
+        Some(fetched)
     }
 }
 
@@ -449,6 +532,28 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakeIdentity(Mutex<HashMap<String, AccountIdentity>>);
+    impl IdentityStore for FakeIdentity {
+        fn identity(&self, id: &ProviderId) -> Result<Option<AccountIdentity>, PortError> {
+            Ok(self.0.lock().unwrap().get(id.as_str()).cloned())
+        }
+        fn set_identity(
+            &self,
+            id: &ProviderId,
+            identity: &AccountIdentity,
+        ) -> Result<(), PortError> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(id.as_str().into(), identity.clone());
+            Ok(())
+        }
+    }
+
+    const PROFILE_FIXTURE: &str = r#"{"account":{"uuid":"u1","email_address":"dev@example.com"},
+        "organization":{"uuid":"o1","name":"Acme"}}"#;
+
     fn tokens_expiring_at(exp: i64) -> OAuthTokens {
         OAuthTokens {
             access_token: "old-access".into(),
@@ -467,6 +572,7 @@ mod tests {
             http: Arc::new(FakeHttp::new(200, FIXTURE)),
             clock: Arc::new(FakeClock(1_700_000_000_000)),
             user_agent: "claude-code/test".into(),
+            identity: Arc::new(FakeIdentity::default()),
         };
         let ctx = FetchContext {
             provider: ProviderId::new("claude-code"),
@@ -476,6 +582,8 @@ mod tests {
         assert_eq!(snap.status, Status::Ok);
         assert_eq!(snap.fetched_at, Timestamp(1_700_000_000_000));
         assert_eq!(snap.windows.len(), 3);
+        // The usage body carries no identity, so a profile parsed from it stays empty → None.
+        assert!(snap.account.is_none());
     }
 
     #[tokio::test]
@@ -485,6 +593,7 @@ mod tests {
             http: Arc::new(FakeHttp::new(429, "")),
             clock: Arc::new(FakeClock(1)),
             user_agent: "claude-code/test".into(),
+            identity: Arc::new(FakeIdentity::default()),
         };
         let ctx = FetchContext {
             provider: ProviderId::new("claude-code"),
@@ -493,6 +602,108 @@ mod tests {
             strat.fetch(&ctx).await,
             Err(FetchError::RateLimited)
         ));
+    }
+
+    #[test]
+    fn parse_profile_reads_email_and_org_lossily() {
+        let id = parse_profile(PROFILE_FIXTURE.as_bytes());
+        assert_eq!(id.email.as_deref(), Some("dev@example.com"));
+        assert_eq!(id.organization.as_deref(), Some("Acme"));
+        // Lossy (ADR 0015): malformed / unknown shapes degrade to empty, never an error.
+        assert!(parse_profile(b"not json").is_empty());
+        assert!(parse_profile(b"{}").is_empty());
+        // A partial profile keeps what it can.
+        let only_email = parse_profile(br#"{"account":{"email_address":"x@y.z"}}"#);
+        assert_eq!(only_email.email.as_deref(), Some("x@y.z"));
+        assert_eq!(only_email.organization, None);
+    }
+
+    #[tokio::test]
+    async fn fetch_identity_is_some_on_200_and_none_otherwise() {
+        let got = fetch_identity(&FakeHttp::new(200, PROFILE_FIXTURE), "tok", "ua").await;
+        assert_eq!(got.unwrap().email.as_deref(), Some("dev@example.com"));
+        // A non-200 (e.g. rejected) yields no identity — we never invent one.
+        assert!(fetch_identity(&FakeHttp::new(401, ""), "tok", "ua")
+            .await
+            .is_none());
+        // 200 with nothing recognizable → None (nothing worth showing).
+        assert!(fetch_identity(&FakeHttp::new(200, "{}"), "tok", "ua")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_identity_fails_closed_when_the_profile_call_errors() {
+        struct OfflineHttp;
+        #[async_trait]
+        impl HttpPort for OfflineHttp {
+            async fn send(&self, _req: HttpRequest) -> Result<HttpResponse, PortError> {
+                Err(PortError::Io("offline".into()))
+            }
+        }
+        assert!(fetch_identity(&OfflineHttp, "tok", "ua").await.is_none());
+    }
+
+    /// Routes by URL: the usage fixture for the usage endpoint, a profile body for the
+    /// profile endpoint, counting profile hits to prove it is fetched at most once.
+    struct RoutingHttp {
+        profile_body: String,
+        profile_calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl HttpPort for RoutingHttp {
+        async fn send(&self, req: HttpRequest) -> Result<HttpResponse, PortError> {
+            let body = if req.url.contains("/profile") {
+                self.profile_calls.fetch_add(1, Ordering::SeqCst);
+                self.profile_body.clone()
+            } else {
+                FIXTURE.to_string()
+            };
+            Ok(HttpResponse {
+                status: 200,
+                body: body.into_bytes(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn strategy_attaches_identity_and_caches_it() {
+        let http = Arc::new(RoutingHttp {
+            profile_body: PROFILE_FIXTURE.into(),
+            profile_calls: AtomicUsize::new(0),
+        });
+        let identity = Arc::new(FakeIdentity::default());
+        let strat = ClaudeCodeStrategy {
+            creds: Arc::new(FakeCreds(Some(tokens_expiring_at(9_999_999_999_999)))),
+            http: http.clone(),
+            clock: Arc::new(FakeClock(1)),
+            user_agent: "claude-code/test".into(),
+            identity: identity.clone(),
+        };
+        let ctx = FetchContext {
+            provider: ProviderId::new("claude-code"),
+        };
+        let snap = strat.fetch(&ctx).await.expect("fetch");
+        assert_eq!(
+            snap.account.as_ref().and_then(|a| a.email.as_deref()),
+            Some("dev@example.com")
+        );
+        // Cached for the source, so the panel can show it without re-fetching.
+        assert_eq!(
+            identity
+                .identity(&ProviderId::new("claude-code"))
+                .unwrap()
+                .and_then(|a| a.email)
+                .as_deref(),
+            Some("dev@example.com")
+        );
+        // A second poll resolves identity from cache — no extra request to the rate-limited host.
+        strat.fetch(&ctx).await.expect("fetch");
+        assert_eq!(
+            http.profile_calls.load(Ordering::SeqCst),
+            1,
+            "profile fetched at most once"
+        );
     }
 
     // ---- refresher ----
