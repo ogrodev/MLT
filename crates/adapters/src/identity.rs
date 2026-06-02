@@ -66,6 +66,20 @@ impl IdentityStore for FileIdentityStore {
         }
         Ok(())
     }
+
+    fn clear_identity(&self, id: &ProviderId) -> Result<(), PortError> {
+        let mut map = self.state.lock();
+        // Idempotent: a missing entry is a no-op (and never needs a disk write).
+        let Some(previous) = map.remove(id.as_str()) else {
+            return Ok(());
+        };
+        if let Err(e) = self.persist(&map) {
+            // Persist failed — restore the entry so the runtime map never diverges from disk.
+            map.insert(id.as_str().to_string(), previous);
+            return Err(e);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -167,5 +181,52 @@ mod tests {
         let got = store.identity(&pid("claude-code")).unwrap().unwrap();
         assert_eq!(got.email.as_deref(), Some("new@example.com"));
         assert_eq!(got.organization.as_deref(), Some("Acme"));
+    }
+
+    #[test]
+    fn clear_forgets_an_identity_and_persists_the_removal() {
+        let path = temp_path("clear");
+        let store = FileIdentityStore::load(path.clone());
+        store
+            .set_identity(&pid("claude-code"), &with_email("dev@example.com"))
+            .unwrap();
+        // A sibling source is untouched by clearing another.
+        store
+            .set_identity(&pid("openrouter"), &with_email("other@example.com"))
+            .unwrap();
+
+        store.clear_identity(&pid("claude-code")).unwrap();
+        assert_eq!(store.identity(&pid("claude-code")).unwrap(), None);
+        assert_eq!(
+            store
+                .identity(&pid("openrouter"))
+                .unwrap()
+                .and_then(|a| a.email)
+                .as_deref(),
+            Some("other@example.com"),
+            "clearing one source leaves the others intact"
+        );
+
+        // The removal is written through: a fresh load won't resurrect the cleared identity,
+        // so a reconnect re-resolves it from the provider instead of serving a stale account.
+        let reloaded = FileIdentityStore::load(path.clone());
+        assert_eq!(reloaded.identity(&pid("claude-code")).unwrap(), None);
+        assert_eq!(
+            reloaded
+                .identity(&pid("openrouter"))
+                .unwrap()
+                .and_then(|a| a.email)
+                .as_deref(),
+            Some("other@example.com")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn clear_is_idempotent_for_an_absent_source() {
+        let store = FileIdentityStore::load(temp_path("clear-absent"));
+        // Nothing stored — clearing must be a no-op, not an error.
+        store.clear_identity(&pid("claude-code")).unwrap();
+        assert_eq!(store.identity(&pid("claude-code")).unwrap(), None);
     }
 }

@@ -35,6 +35,12 @@ pub struct SourceDescriptor {
     pub access_note: &'static str,
     /// How this source is connected (reuse a local login vs. enter an API key).
     pub credential: CredentialKind,
+    /// Keychain entry (under MLT's *own* service) where we cache a refreshed copy of this
+    /// source's reused OAuth login, or `None` for sources we never refresh. Purged on
+    /// disconnect — it is OUR copy, never the vendor's own credential store, which MLT only
+    /// ever reads (ADR 0012). API-key sources leave this `None`: their secret is the
+    /// user-entered key at [`api_key_secret_key`].
+    pub oauth_cache_key: Option<&'static str>,
 }
 
 impl SourceDescriptor {
@@ -51,6 +57,22 @@ impl SourceDescriptor {
             label: None,
             account: None,
         }
+    }
+
+    /// Every keychain entry MLT itself wrote for this source, under our *own* service — the
+    /// exact set to purge on disconnect. This is only what we *cache*: the user-entered API
+    /// key for an [`CredentialKind::ApiKey`] source, plus any refreshed-OAuth copy
+    /// ([`oauth_cache_key`](Self::oauth_cache_key)) for a reused login. It never includes the
+    /// vendor's own credential store, which MLT only ever reads (ADR 0012/0016).
+    pub fn cached_secret_keys(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+        if self.credential == CredentialKind::ApiKey {
+            keys.push(api_key_secret_key(&self.id));
+        }
+        if let Some(oauth) = self.oauth_cache_key {
+            keys.push(oauth.to_string());
+        }
+        keys
     }
 }
 
@@ -102,6 +124,9 @@ pub fn source_catalog() -> Vec<SourceDescriptor> {
                           usage. The token is never shown, never stored in MLT's database or \
                           logs, and is sent only to Anthropic.",
             credential: CredentialKind::LocalLogin,
+            // Our refreshed-OAuth copy lives here; disconnect purges it. Never Claude Code's
+            // own keychain item, which we only read.
+            oauth_cache_key: Some(crate::providers::claude::CACHE_KEY),
         },
         SourceDescriptor {
             id: ProviderId::new("openrouter"),
@@ -111,6 +136,7 @@ pub fn source_catalog() -> Vec<SourceDescriptor> {
                           shown again in full, never written to MLT's database or logs — and \
                           is sent only to OpenRouter.",
             credential: CredentialKind::ApiKey,
+            oauth_cache_key: None,
         },
     ]
 }
@@ -189,6 +215,7 @@ mod tests {
             display_name: "Test Source",
             access_note: "note",
             credential: CredentialKind::LocalLogin,
+            oauth_cache_key: None,
         }
     }
 
@@ -198,6 +225,7 @@ mod tests {
             display_name: "Test API Source",
             access_note: "note",
             credential: CredentialKind::ApiKey,
+            oauth_cache_key: None,
         }
     }
 
@@ -254,6 +282,9 @@ mod tests {
             _id: &ProviderId,
             _identity: &AccountIdentity,
         ) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn clear_identity(&self, _id: &ProviderId) -> Result<(), PortError> {
             Ok(())
         }
     }
@@ -414,5 +445,45 @@ mod tests {
         );
         // Distinct from the OAuth cache namespace, so the two storage paths never collide.
         assert!(api_key_secret_key(&ProviderId::new("x")).starts_with("api_key."));
+    }
+
+    #[test]
+    fn cached_secret_keys_lists_only_what_mlt_caches_itself() {
+        // API-key source: exactly the namespaced key we store, nothing else.
+        assert_eq!(
+            api_descriptor("openrouter").cached_secret_keys(),
+            vec!["api_key.openrouter".to_string()]
+        );
+        // Local-login source with no refreshed-OAuth cache: nothing of ours to purge.
+        assert!(descriptor("cli").cached_secret_keys().is_empty());
+        // Local-login source that caches a refreshed OAuth copy: exactly that entry, and never
+        // an api_key.* key (it has no user-entered key).
+        let oauth_source = SourceDescriptor {
+            oauth_cache_key: Some("oauth.example"),
+            ..descriptor("example")
+        };
+        assert_eq!(
+            oauth_source.cached_secret_keys(),
+            vec!["oauth.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn catalog_declares_each_source_self_cached_secret() {
+        let catalog = source_catalog();
+        // Claude (reused login) caches OUR refreshed OAuth copy under our own service — that is
+        // what disconnect must purge, distinct from Claude Code's own keychain item.
+        let claude = find_source(&catalog, &ProviderId::new("claude-code")).unwrap();
+        assert_eq!(
+            claude.cached_secret_keys(),
+            vec![crate::providers::claude::CACHE_KEY.to_string()]
+        );
+        assert!(crate::providers::claude::CACHE_KEY.starts_with("oauth."));
+        // OpenRouter (api-key) caches the user-entered key, namespaced per provider.
+        let openrouter = find_source(&catalog, &ProviderId::new("openrouter")).unwrap();
+        assert_eq!(
+            openrouter.cached_secret_keys(),
+            vec!["api_key.openrouter".to_string()]
+        );
     }
 }

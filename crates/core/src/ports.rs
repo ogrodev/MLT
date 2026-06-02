@@ -81,6 +81,10 @@ pub trait SourceLabels: Send + Sync {
 pub trait IdentityStore: Send + Sync {
     fn identity(&self, id: &ProviderId) -> Result<Option<AccountIdentity>, PortError>;
     fn set_identity(&self, id: &ProviderId, identity: &AccountIdentity) -> Result<(), PortError>;
+    /// Forget the cached identity for `id` (e.g. on disconnect), so the next fetch re-resolves
+    /// it from the provider rather than serving a stale account. Idempotent: clearing an
+    /// absent entry is not an error.
+    fn clear_identity(&self, id: &ProviderId) -> Result<(), PortError>;
 }
 
 #[async_trait]

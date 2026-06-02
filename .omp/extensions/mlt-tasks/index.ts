@@ -44,6 +44,39 @@ function markPartial(absPath: string): boolean {
   return true;
 }
 
+// Read a task doc for inlining into the start prompt. Returns null when it can't be read, so the
+// caller can fall back to a path-only nudge instead of failing the whole command.
+function readTaskSpec(absPath: string): string | null {
+  try {
+    return readFileSync(absPath, 'utf8').trimEnd();
+  } catch {
+    return null;
+  }
+}
+
+// Build the user prompt that hands the freshly-branched task to the agent. Inlines the task doc
+// (the acceptance criteria + Definition of Done the pre-commit gate enforces) so the agent starts
+// without hunting for it.
+function startPrompt(task: Task, branch: string, spec: string | null): string {
+  const lines = [
+    `Start work on task ${task.title}.`,
+    '',
+    `Branch \`${branch}\` is checked out; \`${task.path}\` is marked 🟡 partial (unstaged).`,
+    '',
+  ];
+  if (spec) {
+    lines.push(`Task spec — \`${task.path}\`:`, '', '````markdown', spec, '````', '');
+  } else {
+    lines.push(`Read the task spec at \`${task.path}\` first (it could not be inlined here).`, '');
+  }
+  lines.push(
+    'Read every doc and ADR the task references, plan the work, then implement it end-to-end.',
+    `As you satisfy each acceptance criterion, tick it (\`- [ ]\` -> \`- [x]\`) in \`${task.path}\`; set **Status:** to ✅ done only once every criterion and the shared Definition of Done hold. The pre-commit task-gate blocks your first commit until that doc reflects real progress.`,
+    'Run `make check` before you finish.',
+  );
+  return lines.join('\n');
+}
+
 async function startTask(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promise<void> {
   if (!ctx.hasUI) {
     ctx.ui.notify('/mlt:start-task needs interactive mode', 'warning');
@@ -131,17 +164,25 @@ async function startTask(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promis
     ctx.ui.notify(`Branch ready, but couldn't update ${task.path}: ${String(err)}`, 'warning');
   }
 
+  // Hand the task straight to the agent instead of stopping at a toast: inline the spec and inject
+  // it as a user prompt. When idle this starts a turn immediately; if a turn is somehow already
+  // running, queue it to fire right after.
+  const spec = readTaskSpec(join(root, task.path));
+  const idle = ctx.isIdle();
+
   ctx.ui.notify(
     [
-      `Started ${task.num} — ${task.title}`,
+      `Started ${task.title}`,
       `• branch: ${branch}`,
       bumped
         ? `• ${task.path} marked 🟡 partial (unstaged)`
         : `• ${task.path} status unchanged (${task.status})`,
-      '• tick acceptance criteria as you finish them — the pre-commit gate blocks until the doc reflects your work.',
+      idle ? '• handing it to the agent now...' : '• queued for the agent — runs after this turn.',
     ].join('\n'),
     'success',
   );
+
+  pi.sendUserMessage(startPrompt(task, branch, spec), idle ? undefined : { deliverAs: 'followUp' });
 }
 
 export default function mltTasks(pi: ExtensionAPI): void {
