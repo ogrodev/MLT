@@ -14,7 +14,7 @@ use mlt_core::providers::openrouter::validate_key;
 use mlt_core::providers::{FetchContext, FetchStrategy};
 use mlt_core::sources::{
     active_sources, api_key_secret_key, discover_sources, find_source, source_catalog,
-    CredentialKind, SourceState,
+    CredentialKind, SourceDescriptor, SourceState,
 };
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -109,9 +109,11 @@ async fn list_sources(sources: tauri::State<'_, AppSources>) -> Result<Vec<Sourc
     .map_err(|e| e.to_string())
 }
 
-/// Enable or disable a source. Takes effect immediately and without a restart: the choice is
-/// persisted, and opting in kicks an off-thread refresh so the popover fills in right away
-/// (rather than waiting for the next poll). Returns the refreshed source list for the UI.
+/// Connect or disconnect a local-login source via its consent toggle. Takes effect
+/// immediately, without a restart. Enabling persists consent and kicks an off-thread refresh so
+/// the popover fills in right away (rather than waiting for the next poll); disabling routes
+/// through [`disconnect`] so the source's cached credential is *purged* from the keychain, not
+/// merely de-consented. Returns the refreshed source list for the UI.
 #[tauri::command]
 async fn set_source_enabled(
     app: tauri::AppHandle,
@@ -121,21 +123,26 @@ async fn set_source_enabled(
 ) -> Result<Vec<SourceState>, String> {
     let id = ProviderId::new(id);
     let catalog = source_catalog();
-    // API-key sources connect by storing a validated key, not by a bare consent toggle —
-    // route them through set_api_key / remove_api_key so consent never diverges from the key.
-    if matches!(
-        find_source(&catalog, &id).map(|d| d.credential),
-        Some(CredentialKind::ApiKey)
-    ) {
-        return Err("Use set_api_key / remove_api_key for API-key sources".into());
+    let descriptor = find_source(&catalog, &id).ok_or("Unknown source")?;
+    // API-key sources connect by storing a validated key, not by a bare consent toggle — route
+    // them through set_api_key / disconnect_source so consent never diverges from the key.
+    if descriptor.credential == CredentialKind::ApiKey {
+        return Err("Use set_api_key / disconnect_source for API-key sources".into());
     }
-    sources
-        .consent
-        .set_enabled(&id, enabled)
-        .map_err(|e| e.to_string())?;
 
     if enabled {
+        sources
+            .consent
+            .set_enabled(&id, true)
+            .map_err(|e| e.to_string())?;
         kick_refresh(&app, &sources);
+    } else {
+        disconnect(
+            sources.secrets.as_ref(),
+            sources.consent.as_ref(),
+            sources.identity.as_ref(),
+            descriptor,
+        )?;
     }
 
     discover_sources(
@@ -172,22 +179,32 @@ async fn apply_api_key(
     consent.set_enabled(id, true).map_err(|e| e.to_string())
 }
 
-/// Delete a stored API key and clear consent — the testable core of [`remove_api_key`].
-/// Idempotent: removing an absent key is not an error.
-fn clear_api_key(
+/// Disconnect a source: purge every secret MLT cached for it under our *own* service, clear
+/// consent so the source goes inert, then forget any provider-fetched identity. The testable
+/// core shared by [`disconnect_source`] and the disable path of [`set_source_enabled`]. We
+/// only ever delete copies WE wrote (the user-entered API key and/or a refreshed-OAuth copy) —
+/// the vendor's own credential store is never touched (ADR 0012/0016). Ordering is deliberate
+/// (ADR 0015): the secret is purged *first*, so if THAT fails we abort with nothing else
+/// changed and the source stays connected (consistent and retryable); once it is gone we clear
+/// consent *before* the cosmetic identity-cache clear, so a failure forgetting the identity can
+/// never leave the source enabled-but-keyless — still reading as "connected" and refreshing
+/// against a missing secret (for an `ApiKey` source [`SourceState::active`] is consent alone).
+/// Idempotent: absent entries are not an error, so disconnecting twice is safe.
+fn disconnect(
     secrets: &dyn SecretStore,
     consent: &dyn ConsentStore,
-    id: &ProviderId,
+    identity: &dyn IdentityStore,
+    descriptor: &SourceDescriptor,
 ) -> Result<(), String> {
-    let catalog = source_catalog();
-    let descriptor = find_source(&catalog, id).ok_or("Unknown source")?;
-    if descriptor.credential != CredentialKind::ApiKey {
-        return Err("This source does not use an API key".into());
+    for key in descriptor.cached_secret_keys() {
+        secrets.delete(&key).map_err(|e| e.to_string())?;
     }
-    secrets
-        .delete(&api_key_secret_key(id))
+    consent
+        .set_enabled(&descriptor.id, false)
         .map_err(|e| e.to_string())?;
-    consent.set_enabled(id, false).map_err(|e| e.to_string())
+    identity
+        .clear_identity(&descriptor.id)
+        .map_err(|e| e.to_string())
 }
 
 /// Enter or replace the API key for an API-key source (e.g. OpenRouter). The key is
@@ -224,17 +241,28 @@ async fn set_api_key(
     .map_err(|e| e.to_string())
 }
 
-/// Remove a source's stored API key: delete it from the keychain and clear consent so the
-/// source reads as disconnected. Takes effect immediately, without a restart.
+/// Disconnect any connected source: remove every secret MLT cached for it from the OS keychain,
+/// forget its provider-fetched identity, and clear consent — so its tile disappears and its
+/// refresh stops, immediately and without a restart, and it can be reconnected afterwards. Only
+/// copies WE wrote are deleted; the vendor's own credential store is never touched
+/// (ADR 0012/0016). Works for any source kind — the disconnect action for both reused logins
+/// and API-key sources.
 #[tauri::command]
-async fn remove_api_key(
+async fn disconnect_source(
     sources: tauri::State<'_, AppSources>,
     id: String,
 ) -> Result<Vec<SourceState>, String> {
     let id = ProviderId::new(id);
-    clear_api_key(sources.secrets.as_ref(), sources.consent.as_ref(), &id)?;
+    let catalog = source_catalog();
+    let descriptor = find_source(&catalog, &id).ok_or("Unknown source")?;
+    disconnect(
+        sources.secrets.as_ref(),
+        sources.consent.as_ref(),
+        sources.identity.as_ref(),
+        descriptor,
+    )?;
     discover_sources(
-        &source_catalog(),
+        &catalog,
         sources.probe.as_ref(),
         sources.consent.as_ref(),
         sources.labels.as_ref(),
@@ -399,7 +427,7 @@ pub fn run() {
             list_sources,
             set_source_enabled,
             set_api_key,
-            remove_api_key,
+            disconnect_source,
             set_source_label,
             quit
         ])
@@ -481,13 +509,14 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_api_key, clear_api_key};
+    use super::{apply_api_key, disconnect};
     use super::{popover_action, PopoverAction, REOPEN_DEBOUNCE};
     use async_trait::async_trait;
-    use mlt_core::domain::ProviderId;
+    use mlt_core::domain::{AccountIdentity, ProviderId};
     use mlt_core::ports::{
-        ConsentStore, HttpPort, HttpRequest, HttpResponse, PortError, SecretStore,
+        ConsentStore, HttpPort, HttpRequest, HttpResponse, IdentityStore, PortError, SecretStore,
     };
+    use mlt_core::sources::{find_source, source_catalog};
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -572,6 +601,22 @@ mod tests {
         }
         fn set_enabled(&self, id: &ProviderId, enabled: bool) -> Result<(), PortError> {
             self.0.lock().unwrap().insert(id.as_str().into(), enabled);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct MemIdentity(Mutex<HashMap<String, AccountIdentity>>);
+    impl IdentityStore for MemIdentity {
+        fn identity(&self, id: &ProviderId) -> Result<Option<AccountIdentity>, PortError> {
+            Ok(self.0.lock().unwrap().get(id.as_str()).cloned())
+        }
+        fn set_identity(&self, id: &ProviderId, v: &AccountIdentity) -> Result<(), PortError> {
+            self.0.lock().unwrap().insert(id.as_str().into(), v.clone());
+            Ok(())
+        }
+        fn clear_identity(&self, id: &ProviderId) -> Result<(), PortError> {
+            self.0.lock().unwrap().remove(id.as_str());
             Ok(())
         }
     }
@@ -686,22 +731,126 @@ mod tests {
     }
 
     #[test]
-    fn clear_api_key_deletes_the_key_and_disconnects() {
+    fn disconnect_purges_an_api_key_sources_secret_and_consent() {
         let secrets = MemSecrets::default();
         secrets.set("api_key.openrouter", "sk-or-v1-good").unwrap();
         let consent = FakeConsent::default();
         consent.set_enabled(&openrouter(), true).unwrap();
+        let identity = MemIdentity::default();
 
-        clear_api_key(&secrets, &consent, &openrouter()).expect("removal succeeds");
+        let catalog = source_catalog();
+        let descriptor = find_source(&catalog, &openrouter()).unwrap();
+        disconnect(&secrets, &consent, &identity, descriptor).expect("disconnect succeeds");
+
         assert_eq!(secrets.get("api_key.openrouter").unwrap(), None);
         assert!(!consent.is_enabled(&openrouter()).unwrap());
     }
 
     #[test]
-    fn clear_api_key_refuses_a_non_api_key_source() {
+    fn disconnect_purges_a_reused_logins_cached_oauth_copy_and_identity() {
+        // The task-004 fix: disconnecting a reused-login source (Claude Code) must remove the
+        // refreshed-OAuth copy MLT cached under its OWN service — not merely drop consent.
+        let claude = ProviderId::new("claude-code");
         let secrets = MemSecrets::default();
+        secrets
+            .set("oauth.claude", "{\"access_token\":\"x\"}")
+            .unwrap();
         let consent = FakeConsent::default();
-        clear_api_key(&secrets, &consent, &ProviderId::new("claude-code"))
-            .expect_err("local-login sources reject remove_api_key");
+        consent.set_enabled(&claude, true).unwrap();
+        let identity = MemIdentity::default();
+        identity
+            .set_identity(
+                &claude,
+                &AccountIdentity {
+                    email: Some("dev@example.com".into()),
+                    organization: None,
+                },
+            )
+            .unwrap();
+
+        let catalog = source_catalog();
+        let descriptor = find_source(&catalog, &claude).unwrap();
+        disconnect(&secrets, &consent, &identity, descriptor).expect("disconnect succeeds");
+
+        // Acceptance 3: the cached secret is gone from the keychain…
+        assert_eq!(
+            secrets.get("oauth.claude").unwrap(),
+            None,
+            "the cached OAuth copy must be purged"
+        );
+        // …consent is cleared so the tile disappears and refresh stops…
+        assert!(!consent.is_enabled(&claude).unwrap());
+        // …and the provider-fetched identity is forgotten, so a reconnect re-resolves it fresh.
+        assert_eq!(identity.identity(&claude).unwrap(), None);
+    }
+
+    #[test]
+    fn disconnect_is_idempotent_and_scoped_to_this_sources_own_keys() {
+        let secrets = MemSecrets::default();
+        // Another source's secret must survive disconnecting Claude — disconnect only ever
+        // removes the keys WE cached for the source being disconnected.
+        secrets.set("api_key.openrouter", "sk-or-v1-keep").unwrap();
+        let consent = FakeConsent::default();
+        let identity = MemIdentity::default();
+
+        let catalog = source_catalog();
+        let claude = find_source(&catalog, &ProviderId::new("claude-code")).unwrap();
+        // Nothing of Claude's is stored — disconnect must be a no-op success, not an error.
+        disconnect(&secrets, &consent, &identity, claude).expect("idempotent disconnect");
+
+        assert!(!consent.is_enabled(&ProviderId::new("claude-code")).unwrap());
+        assert_eq!(
+            secrets.get("api_key.openrouter").unwrap().as_deref(),
+            Some("sk-or-v1-keep"),
+            "another source's secret is left untouched"
+        );
+    }
+
+    #[test]
+    fn disconnect_clears_consent_even_when_forgetting_identity_fails() {
+        // Regression (PR #5 review): once the secret is purged the source must go inert. A
+        // failure in the *cosmetic* identity-cache clear must not leave consent `true` —
+        // otherwise an ApiKey source (active == enabled) keeps refreshing against a now-missing
+        // key. disconnect() clears consent BEFORE the identity clear, so it sticks even when the
+        // identity clear fails; the error is still surfaced (not swallowed).
+        struct FailingIdentityClear;
+        impl IdentityStore for FailingIdentityClear {
+            fn identity(&self, _id: &ProviderId) -> Result<Option<AccountIdentity>, PortError> {
+                Ok(None)
+            }
+            fn set_identity(
+                &self,
+                _id: &ProviderId,
+                _v: &AccountIdentity,
+            ) -> Result<(), PortError> {
+                Ok(())
+            }
+            fn clear_identity(&self, _id: &ProviderId) -> Result<(), PortError> {
+                Err(PortError::Io("identity store write failed".into()))
+            }
+        }
+
+        let secrets = MemSecrets::default();
+        secrets.set("api_key.openrouter", "sk-or-v1-good").unwrap();
+        let consent = FakeConsent::default();
+        consent.set_enabled(&openrouter(), true).unwrap();
+
+        let catalog = source_catalog();
+        let descriptor = find_source(&catalog, &openrouter()).unwrap();
+        let result = disconnect(&secrets, &consent, &FailingIdentityClear, descriptor);
+
+        // The failure is surfaced, not swallowed…
+        assert!(
+            result.is_err(),
+            "a post-purge failure must surface as an error"
+        );
+        // …the secret was still purged (the first step)…
+        assert_eq!(secrets.get("api_key.openrouter").unwrap(), None);
+        // …and consent is cleared regardless, so the source is inert (not active) and stops
+        // refreshing rather than reading as connected with a missing key.
+        assert!(
+            !consent.is_enabled(&openrouter()).unwrap(),
+            "consent must be cleared before the identity clear so a later failure can't leave the source enabled-but-keyless"
+        );
     }
 }

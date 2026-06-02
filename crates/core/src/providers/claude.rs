@@ -286,10 +286,11 @@ pub const CACHE_KEY: &str = "oauth.claude";
 const REFRESH_SKEW_MS: i64 = 60_000;
 
 /// An [`OAuthCredentialSource`] that keeps a valid Claude access token available, refreshing
-/// only when necessary. It prefers whichever of {our cached copy, Claude Code's live token}
-/// is freshest, so in practice it rarely refreshes itself (Claude Code keeps its own token
-/// fresh and we piggyback). Refreshed tokens are stored in OUR `SecretStore`, NEVER written
-/// back to Claude Code's keychain item — so we cannot break the user's Claude Code login.
+/// only when necessary. When Claude Code's own token is fresh it is used as-is — *without even
+/// reading our keychain cache*, so the user isn't prompted by the OS on every refresh — and we
+/// fall back to our cached copy (then a network refresh) only when that token is missing or
+/// stale. Refreshed tokens are stored in OUR `SecretStore`, NEVER written back to Claude
+/// Code's keychain item — so we cannot break the user's Claude Code login.
 pub struct ClaudeOAuthRefresher {
     bootstrap: Arc<dyn OAuthCredentialSource>,
     cache: Arc<dyn SecretStore>,
@@ -426,16 +427,27 @@ fn pick_freshest(a: Option<OAuthTokens>, b: Option<OAuthTokens>) -> Option<OAuth
 #[async_trait]
 impl OAuthCredentialSource for ClaudeOAuthRefresher {
     async fn load(&self) -> Result<OAuthTokens, PortError> {
-        let chosen = pick_freshest(self.load_cached(), self.bootstrap.load().await.ok())
-            .ok_or(PortError::NotFound)?;
-        if self.is_fresh(&chosen) {
-            return Ok(chosen);
+        let bootstrap = self.bootstrap.load().await.ok();
+        // Fast path: Claude Code keeps its own token fresh, and on most setups it lives in a
+        // plaintext file (no keychain). When it's fresh, return it directly and never read our
+        // keychain cache — that read is what pops a macOS keychain prompt on every refresh.
+        match bootstrap {
+            Some(token) if self.is_fresh(&token) => Ok(token),
+            // Vendor token stale or absent → consult our cached refreshed copy (a keychain
+            // read), prefer whichever is freshest, and refresh only as a last resort.
+            bootstrap => {
+                let chosen =
+                    pick_freshest(self.load_cached(), bootstrap).ok_or(PortError::NotFound)?;
+                if self.is_fresh(&chosen) {
+                    return Ok(chosen);
+                }
+                let refreshed = self.refresh(&chosen).await?;
+                if let Ok(json) = serde_json::to_string(&refreshed) {
+                    let _ = self.cache.set(CACHE_KEY, &json);
+                }
+                Ok(refreshed)
+            }
         }
-        let refreshed = self.refresh(&chosen).await?;
-        if let Ok(json) = serde_json::to_string(&refreshed) {
-            let _ = self.cache.set(CACHE_KEY, &json);
-        }
-        Ok(refreshed)
     }
 }
 
@@ -547,6 +559,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(id.as_str().into(), identity.clone());
+            Ok(())
+        }
+        fn clear_identity(&self, id: &ProviderId) -> Result<(), PortError> {
+            self.0.lock().unwrap().remove(id.as_str());
             Ok(())
         }
     }
@@ -780,5 +796,31 @@ mod tests {
         let t = refresher.load().await.unwrap();
         assert_eq!(t.access_token, "cached-fresh");
         assert_eq!(http.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn refresher_skips_the_cache_when_the_vendor_token_is_fresh() {
+        // Reading our keychain cache is what pops a macOS keychain prompt. When Claude Code's
+        // own token is fresh, the refresher must use it and never touch the cache at all.
+        struct ForbiddenCache;
+        impl SecretStore for ForbiddenCache {
+            fn get(&self, _k: &str) -> Result<Option<String>, PortError> {
+                panic!("must not read the keychain cache when the vendor token is fresh");
+            }
+            fn set(&self, _k: &str, _v: &str) -> Result<(), PortError> {
+                panic!("must not write the keychain cache when the vendor token is fresh");
+            }
+            fn delete(&self, _k: &str) -> Result<(), PortError> {
+                Ok(())
+            }
+        }
+        let refresher = ClaudeOAuthRefresher::new(
+            Arc::new(FakeCreds(Some(tokens_expiring_at(10_000_000)))), // fresh vs clock 1000
+            Arc::new(ForbiddenCache),
+            Arc::new(FakeHttp::new(200, "{}")),
+            Arc::new(FakeClock(1_000)),
+        );
+        let t = refresher.load().await.unwrap();
+        assert_eq!(t.access_token, "old-access");
     }
 }

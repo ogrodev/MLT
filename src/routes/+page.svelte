@@ -1,12 +1,12 @@
 <script lang="ts">
 import { onMount } from 'svelte';
 import {
+  disconnectSource,
   fetchClaudeUsage,
   listSources,
   onUsageError,
   onUsageUpdated,
   quitApp,
-  removeApiKey,
   setApiKey,
   setSourceEnabled,
   setSourceLabel,
@@ -172,10 +172,10 @@ async function saveKey(source: SourceState): Promise<void> {
   }
 }
 
-async function removeKey(source: SourceState): Promise<void> {
+async function disconnectKeySource(source: SourceState): Promise<void> {
   keyError = null;
   try {
-    sources = await removeApiKey(source.id);
+    sources = await disconnectSource(source.id);
   } catch (e) {
     keyError = String(e);
   }
@@ -393,10 +393,10 @@ onMount(() => {
                   {#if s.enabled}
                     <button
                       type="button"
-                      onclick={() => removeKey(s)}
+                      onclick={() => disconnectKeySource(s)}
                       class="rounded px-2 py-1 text-[12px] text-red-600 transition-colors hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950/40"
                     >
-                      Remove
+                      Disconnect
                     </button>
                   {/if}
                 </div>

@@ -68,9 +68,11 @@ export const setSourceEnabled = (id: string, enabled: boolean): Promise<SourceSt
 export const setApiKey = (id: string, key: string): Promise<SourceState[]> =>
   invoke('set_api_key', { id, key });
 
-// Remove a stored API key and disconnect the source. Returns the refreshed source list.
-export const removeApiKey = (id: string): Promise<SourceState[]> =>
-  invoke('remove_api_key', { id });
+// Disconnect a source: purge any secret MLT cached for it from the keychain and clear consent,
+// so its tile disappears and refresh stops — effective immediately, reconnectable afterwards.
+// Returns the refreshed source list.
+export const disconnectSource = (id: string): Promise<SourceState[]> =>
+  invoke('disconnect_source', { id });
 
 // Set (or clear, with an empty string) a source's display name. Returns the refreshed list.
 export const setSourceLabel = (id: string, name: string): Promise<SourceState[]> =>
