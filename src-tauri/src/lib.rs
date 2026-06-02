@@ -179,12 +179,16 @@ async fn apply_api_key(
     consent.set_enabled(id, true).map_err(|e| e.to_string())
 }
 
-/// Disconnect a source: purge every secret MLT cached for it under our *own* service, forget
-/// any provider-fetched identity, then clear consent. The testable core shared by
-/// [`disconnect_source`] and the disable path of [`set_source_enabled`]. We only ever delete
-/// copies WE wrote (the user-entered API key and/or a refreshed-OAuth copy) — the vendor's own
-/// credential store is never touched (ADR 0012/0016). Secrets are purged *before* consent is
-/// cleared, so a keychain failure leaves the source still connected rather than half-removed.
+/// Disconnect a source: purge every secret MLT cached for it under our *own* service, clear
+/// consent so the source goes inert, then forget any provider-fetched identity. The testable
+/// core shared by [`disconnect_source`] and the disable path of [`set_source_enabled`]. We
+/// only ever delete copies WE wrote (the user-entered API key and/or a refreshed-OAuth copy) —
+/// the vendor's own credential store is never touched (ADR 0012/0016). Ordering is deliberate
+/// (ADR 0015): the secret is purged *first*, so if THAT fails we abort with nothing else
+/// changed and the source stays connected (consistent and retryable); once it is gone we clear
+/// consent *before* the cosmetic identity-cache clear, so a failure forgetting the identity can
+/// never leave the source enabled-but-keyless — still reading as "connected" and refreshing
+/// against a missing secret (for an `ApiKey` source [`SourceState::active`] is consent alone).
 /// Idempotent: absent entries are not an error, so disconnecting twice is safe.
 fn disconnect(
     secrets: &dyn SecretStore,
@@ -195,11 +199,11 @@ fn disconnect(
     for key in descriptor.cached_secret_keys() {
         secrets.delete(&key).map_err(|e| e.to_string())?;
     }
-    identity
-        .clear_identity(&descriptor.id)
-        .map_err(|e| e.to_string())?;
     consent
         .set_enabled(&descriptor.id, false)
+        .map_err(|e| e.to_string())?;
+    identity
+        .clear_identity(&descriptor.id)
         .map_err(|e| e.to_string())
 }
 
@@ -799,6 +803,54 @@ mod tests {
             secrets.get("api_key.openrouter").unwrap().as_deref(),
             Some("sk-or-v1-keep"),
             "another source's secret is left untouched"
+        );
+    }
+
+    #[test]
+    fn disconnect_clears_consent_even_when_forgetting_identity_fails() {
+        // Regression (PR #5 review): once the secret is purged the source must go inert. A
+        // failure in the *cosmetic* identity-cache clear must not leave consent `true` —
+        // otherwise an ApiKey source (active == enabled) keeps refreshing against a now-missing
+        // key. disconnect() clears consent BEFORE the identity clear, so it sticks even when the
+        // identity clear fails; the error is still surfaced (not swallowed).
+        struct FailingIdentityClear;
+        impl IdentityStore for FailingIdentityClear {
+            fn identity(&self, _id: &ProviderId) -> Result<Option<AccountIdentity>, PortError> {
+                Ok(None)
+            }
+            fn set_identity(
+                &self,
+                _id: &ProviderId,
+                _v: &AccountIdentity,
+            ) -> Result<(), PortError> {
+                Ok(())
+            }
+            fn clear_identity(&self, _id: &ProviderId) -> Result<(), PortError> {
+                Err(PortError::Io("identity store write failed".into()))
+            }
+        }
+
+        let secrets = MemSecrets::default();
+        secrets.set("api_key.openrouter", "sk-or-v1-good").unwrap();
+        let consent = FakeConsent::default();
+        consent.set_enabled(&openrouter(), true).unwrap();
+
+        let catalog = source_catalog();
+        let descriptor = find_source(&catalog, &openrouter()).unwrap();
+        let result = disconnect(&secrets, &consent, &FailingIdentityClear, descriptor);
+
+        // The failure is surfaced, not swallowed…
+        assert!(
+            result.is_err(),
+            "a post-purge failure must surface as an error"
+        );
+        // …the secret was still purged (the first step)…
+        assert_eq!(secrets.get("api_key.openrouter").unwrap(), None);
+        // …and consent is cleared regardless, so the source is inert (not active) and stops
+        // refreshing rather than reading as connected with a missing key.
+        assert!(
+            !consent.is_enabled(&openrouter()).unwrap(),
+            "consent must be cleared before the identity clear so a later failure can't leave the source enabled-but-keyless"
         );
     }
 }

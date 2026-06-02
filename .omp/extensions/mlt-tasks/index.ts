@@ -54,6 +54,13 @@ function readTaskSpec(absPath: string): string | null {
   }
 }
 
+// A fence at least one backtick longer than the longest backtick run in `body`, so inlined
+// content (a task doc often contains its own ``` fences) can never close the wrapper early.
+function fenceFor(body: string): string {
+  const longest = body.match(/`+/g)?.reduce((max, run) => Math.max(max, run.length), 0) ?? 0;
+  return '`'.repeat(Math.max(3, longest + 1));
+}
+
 // Build the user prompt that hands the freshly-branched task to the agent. Inlines the task doc
 // (the acceptance criteria + Definition of Done the pre-commit gate enforces) so the agent starts
 // without hunting for it.
@@ -65,7 +72,8 @@ function startPrompt(task: Task, branch: string, spec: string | null): string {
     '',
   ];
   if (spec) {
-    lines.push(`Task spec — \`${task.path}\`:`, '', '````markdown', spec, '````', '');
+    const fence = fenceFor(spec);
+    lines.push(`Task spec — \`${task.path}\`:`, '', `${fence}markdown`, spec, fence, '');
   } else {
     lines.push(`Read the task spec at \`${task.path}\` first (it could not be inlined here).`, '');
   }
@@ -182,7 +190,18 @@ async function startTask(pi: ExtensionAPI, ctx: ExtensionCommandContext): Promis
     'success',
   );
 
-  pi.sendUserMessage(startPrompt(task, branch, spec), idle ? undefined : { deliverAs: 'followUp' });
+  // sendUserMessage goes through the prompt flow, which can reject (e.g. model/API-key
+  // validation when idle). Handle it instead of leaving an unhandled rejection after we already
+  // toasted success — the branch itself is already prepared regardless.
+  pi.sendUserMessage(
+    startPrompt(task, branch, spec),
+    idle ? undefined : { deliverAs: 'followUp' },
+  ).catch((err) => {
+    ctx.ui.notify(
+      `Task branch is ready, but handing it to the agent failed: ${String(err)}`,
+      'error',
+    );
+  });
 }
 
 export default function mltTasks(pi: ExtensionAPI): void {
