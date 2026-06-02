@@ -2,11 +2,20 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use mlt_adapters::{FileConsentStore, LocalSourceProbe};
+use mlt_adapters::{
+    FileConsentStore, FileIdentityStore, FileLabelStore, KeyringSecretStore, LocalSourceProbe,
+    ReqwestHttp, KEYCHAIN_SERVICE,
+};
 use mlt_core::domain::{ProviderId, UsageSnapshot};
-use mlt_core::ports::{ConsentStore, SourceProbe};
+use mlt_core::ports::{
+    ConsentStore, HttpPort, IdentityStore, SecretStore, SourceLabels, SourceProbe,
+};
+use mlt_core::providers::openrouter::validate_key;
 use mlt_core::providers::{FetchContext, FetchStrategy};
-use mlt_core::sources::{active_sources, discover_sources, source_catalog, SourceState};
+use mlt_core::sources::{
+    active_sources, api_key_secret_key, discover_sources, find_source, source_catalog,
+    CredentialKind, SourceState,
+};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
@@ -41,6 +50,10 @@ struct PopoverState {
 struct AppSources {
     probe: Arc<dyn SourceProbe>,
     consent: Arc<dyn ConsentStore>,
+    secrets: Arc<dyn SecretStore>,
+    labels: Arc<dyn SourceLabels>,
+    http: Arc<dyn HttpPort>,
+    identity: Arc<dyn IdentityStore>,
 }
 
 /// Pure decision for a tray left-click, isolated from Tauri so it is unit-testable.
@@ -76,7 +89,9 @@ async fn fetch_claude_usage(
     if !connected {
         return Err("Claude Code is not connected".into());
     }
-    claude_usage().await.map_err(|e| e.to_string())
+    claude_usage(sources.identity.clone())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Discover every known source for the connect screen: presence (metadata only) + the user's
@@ -87,6 +102,8 @@ async fn list_sources(sources: tauri::State<'_, AppSources>) -> Result<Vec<Sourc
         &source_catalog(),
         sources.probe.as_ref(),
         sources.consent.as_ref(),
+        sources.labels.as_ref(),
+        sources.identity.as_ref(),
     )
     .await
     .map_err(|e| e.to_string())
@@ -103,27 +120,168 @@ async fn set_source_enabled(
     enabled: bool,
 ) -> Result<Vec<SourceState>, String> {
     let id = ProviderId::new(id);
+    let catalog = source_catalog();
+    // API-key sources connect by storing a validated key, not by a bare consent toggle —
+    // route them through set_api_key / remove_api_key so consent never diverges from the key.
+    if matches!(
+        find_source(&catalog, &id).map(|d| d.credential),
+        Some(CredentialKind::ApiKey)
+    ) {
+        return Err("Use set_api_key / remove_api_key for API-key sources".into());
+    }
     sources
         .consent
         .set_enabled(&id, enabled)
         .map_err(|e| e.to_string())?;
 
     if enabled {
-        let app = app.clone();
-        let probe = sources.probe.clone();
-        let consent = sources.consent.clone();
-        tauri::async_runtime::spawn(async move {
-            refresh_active(&app, probe.as_ref(), consent.as_ref()).await;
-        });
+        kick_refresh(&app, &sources);
     }
 
+    discover_sources(
+        &catalog,
+        sources.probe.as_ref(),
+        sources.consent.as_ref(),
+        sources.labels.as_ref(),
+        sources.identity.as_ref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Validate, then store an API key and mark the source connected — the testable core of
+/// [`set_api_key`]. Validation happens **first**, so a rejected or unverifiable key is never
+/// written and consent is never set: a bad key can't leave a source silently reading as
+/// connected. The key is stored in the keychain only; its value is neither returned nor logged.
+async fn apply_api_key(
+    secrets: &dyn SecretStore,
+    consent: &dyn ConsentStore,
+    http: &dyn HttpPort,
+    id: &ProviderId,
+    key: &str,
+) -> Result<(), String> {
+    let catalog = source_catalog();
+    let descriptor = find_source(&catalog, id).ok_or("Unknown source")?;
+    if descriptor.credential != CredentialKind::ApiKey {
+        return Err("This source does not use an API key".into());
+    }
+    validate_key(http, key).await.map_err(|e| e.to_string())?;
+    secrets
+        .set(&api_key_secret_key(id), key.trim())
+        .map_err(|e| e.to_string())?;
+    consent.set_enabled(id, true).map_err(|e| e.to_string())
+}
+
+/// Delete a stored API key and clear consent — the testable core of [`remove_api_key`].
+/// Idempotent: removing an absent key is not an error.
+fn clear_api_key(
+    secrets: &dyn SecretStore,
+    consent: &dyn ConsentStore,
+    id: &ProviderId,
+) -> Result<(), String> {
+    let catalog = source_catalog();
+    let descriptor = find_source(&catalog, id).ok_or("Unknown source")?;
+    if descriptor.credential != CredentialKind::ApiKey {
+        return Err("This source does not use an API key".into());
+    }
+    secrets
+        .delete(&api_key_secret_key(id))
+        .map_err(|e| e.to_string())?;
+    consent.set_enabled(id, false).map_err(|e| e.to_string())
+}
+
+/// Enter or replace the API key for an API-key source (e.g. OpenRouter). The key is
+/// **validated against the provider before anything is stored** — a rejected key returns a
+/// clear error and the source stays disconnected, never a silent "connected" with a bad key.
+/// On success the key is written to the OS keychain only (never the DB or logs), consent is
+/// recorded so the source reads as connected, and an off-thread refresh is kicked so it takes
+/// effect without a restart. The key itself is never returned to the UI.
+#[tauri::command]
+async fn set_api_key(
+    app: tauri::AppHandle,
+    sources: tauri::State<'_, AppSources>,
+    id: String,
+    key: String,
+) -> Result<Vec<SourceState>, String> {
+    let id = ProviderId::new(id);
+    apply_api_key(
+        sources.secrets.as_ref(),
+        sources.consent.as_ref(),
+        sources.http.as_ref(),
+        &id,
+        &key,
+    )
+    .await?;
+    kick_refresh(&app, &sources);
     discover_sources(
         &source_catalog(),
         sources.probe.as_ref(),
         sources.consent.as_ref(),
+        sources.labels.as_ref(),
+        sources.identity.as_ref(),
     )
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Remove a source's stored API key: delete it from the keychain and clear consent so the
+/// source reads as disconnected. Takes effect immediately, without a restart.
+#[tauri::command]
+async fn remove_api_key(
+    sources: tauri::State<'_, AppSources>,
+    id: String,
+) -> Result<Vec<SourceState>, String> {
+    let id = ProviderId::new(id);
+    clear_api_key(sources.secrets.as_ref(), sources.consent.as_ref(), &id)?;
+    discover_sources(
+        &source_catalog(),
+        sources.probe.as_ref(),
+        sources.consent.as_ref(),
+        sources.labels.as_ref(),
+        sources.identity.as_ref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Set (or clear, with a blank string) the user-assigned custom name for a source — shown as
+/// the panel *title*, distinct from the provider's own name and the auto-fetched account email.
+/// Persisted as a plain setting (never the keychain); returns the refreshed source list so the
+/// UI reflects the new title without a restart.
+#[tauri::command]
+async fn set_source_label(
+    sources: tauri::State<'_, AppSources>,
+    id: String,
+    name: String,
+) -> Result<Vec<SourceState>, String> {
+    let id = ProviderId::new(id);
+    let trimmed = name.trim();
+    let label = (!trimmed.is_empty()).then_some(trimmed);
+    sources
+        .labels
+        .set_label(&id, label)
+        .map_err(|e| e.to_string())?;
+    discover_sources(
+        &source_catalog(),
+        sources.probe.as_ref(),
+        sources.consent.as_ref(),
+        sources.labels.as_ref(),
+        sources.identity.as_ref(),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Kick an immediate off-thread refresh of the active sources, so a just-connected source
+/// fills the popover without waiting for the next poll — and without blocking the command.
+fn kick_refresh(app: &tauri::AppHandle, sources: &AppSources) {
+    let app = app.clone();
+    let probe = sources.probe.clone();
+    let consent = sources.consent.clone();
+    let identity = sources.identity.clone();
+    tauri::async_runtime::spawn(async move {
+        refresh_active(&app, probe.as_ref(), consent.as_ref(), identity).await;
+    });
 }
 
 /// Quit the whole app. Both the popover footer and the tray menu route here.
@@ -132,8 +290,10 @@ fn quit(app: tauri::AppHandle) {
     app.exit(0);
 }
 
-async fn claude_usage() -> Result<UsageSnapshot, mlt_core::providers::FetchError> {
-    let strategy = mlt_adapters::claude_strategy();
+async fn claude_usage(
+    identity: Arc<dyn IdentityStore>,
+) -> Result<UsageSnapshot, mlt_core::providers::FetchError> {
+    let strategy = mlt_adapters::claude_strategy(identity);
     let ctx = FetchContext {
         provider: ProviderId::new("claude-code"),
     };
@@ -144,9 +304,10 @@ async fn claude_usage() -> Result<UsageSnapshot, mlt_core::providers::FetchError
 /// id → fetcher is the single place a connected source becomes a network call.
 async fn fetch_for(
     id: &ProviderId,
+    identity: Arc<dyn IdentityStore>,
 ) -> Option<Result<UsageSnapshot, mlt_core::providers::FetchError>> {
     match id.as_str() {
-        "claude-code" => Some(claude_usage().await),
+        "claude-code" => Some(claude_usage(identity).await),
         _ => None,
     }
 }
@@ -158,12 +319,13 @@ async fn refresh_active(
     app: &tauri::AppHandle,
     probe: &dyn SourceProbe,
     consent: &dyn ConsentStore,
+    identity: Arc<dyn IdentityStore>,
 ) {
     let Ok(ids) = active_sources(&source_catalog(), probe, consent).await else {
         return;
     };
     for id in &ids {
-        match fetch_for(id).await {
+        match fetch_for(id, identity.clone()).await {
             Some(Ok(snapshot)) => {
                 let _ = app.emit("usage-updated", snapshot);
             }
@@ -181,10 +343,11 @@ fn spawn_refresh_loop(
     app: tauri::AppHandle,
     probe: Arc<dyn SourceProbe>,
     consent: Arc<dyn ConsentStore>,
+    identity: Arc<dyn IdentityStore>,
 ) {
     tauri::async_runtime::spawn(async move {
         loop {
-            refresh_active(&app, probe.as_ref(), consent.as_ref()).await;
+            refresh_active(&app, probe.as_ref(), consent.as_ref(), identity.clone()).await;
             tokio::time::sleep(Duration::from_secs(REFRESH_SECS)).await;
         }
     });
@@ -235,6 +398,9 @@ pub fn run() {
             fetch_claude_usage,
             list_sources,
             set_source_enabled,
+            set_api_key,
+            remove_api_key,
+            set_source_label,
             quit
         ])
         .setup(|app| {
@@ -291,12 +457,22 @@ pub fn run() {
             let consent_path = app.path().app_config_dir()?.join("consent.json");
             let probe: Arc<dyn SourceProbe> = Arc::new(LocalSourceProbe);
             let consent: Arc<dyn ConsentStore> = Arc::new(FileConsentStore::load(consent_path));
+            let labels_path = app.path().app_config_dir()?.join("labels.json");
+            let labels: Arc<dyn SourceLabels> = Arc::new(FileLabelStore::load(labels_path));
+            let identity_path = app.path().app_config_dir()?.join("identity.json");
+            let identity: Arc<dyn IdentityStore> = Arc::new(FileIdentityStore::load(identity_path));
+            let secrets: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore::new(KEYCHAIN_SERVICE));
+            let http: Arc<dyn HttpPort> = Arc::new(ReqwestHttp::new());
             app.manage(AppSources {
                 probe: probe.clone(),
                 consent: consent.clone(),
+                secrets,
+                http,
+                labels,
+                identity: identity.clone(),
             });
 
-            spawn_refresh_loop(app.handle().clone(), probe, consent);
+            spawn_refresh_loop(app.handle().clone(), probe, consent, identity);
             Ok(())
         })
         .run(tauri::generate_context!())
@@ -305,7 +481,15 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use super::{apply_api_key, clear_api_key};
     use super::{popover_action, PopoverAction, REOPEN_DEBOUNCE};
+    use async_trait::async_trait;
+    use mlt_core::domain::ProviderId;
+    use mlt_core::ports::{
+        ConsentStore, HttpPort, HttpRequest, HttpResponse, PortError, SecretStore,
+    };
+    use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     #[test]
@@ -356,5 +540,168 @@ mod tests {
             ),
             PopoverAction::Show
         );
+    }
+
+    #[derive(Default)]
+    struct MemSecrets(Mutex<HashMap<String, String>>);
+    impl SecretStore for MemSecrets {
+        fn get(&self, k: &str) -> Result<Option<String>, PortError> {
+            Ok(self.0.lock().unwrap().get(k).cloned())
+        }
+        fn set(&self, k: &str, v: &str) -> Result<(), PortError> {
+            self.0.lock().unwrap().insert(k.into(), v.into());
+            Ok(())
+        }
+        fn delete(&self, k: &str) -> Result<(), PortError> {
+            self.0.lock().unwrap().remove(k);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeConsent(Mutex<HashMap<String, bool>>);
+    impl ConsentStore for FakeConsent {
+        fn is_enabled(&self, id: &ProviderId) -> Result<bool, PortError> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .get(id.as_str())
+                .copied()
+                .unwrap_or(false))
+        }
+        fn set_enabled(&self, id: &ProviderId, enabled: bool) -> Result<(), PortError> {
+            self.0.lock().unwrap().insert(id.as_str().into(), enabled);
+            Ok(())
+        }
+    }
+
+    /// Returns a fixed HTTP status, or a transport error, for any request.
+    struct FakeHttp(Result<u16, ()>);
+    #[async_trait]
+    impl HttpPort for FakeHttp {
+        async fn send(&self, _req: HttpRequest) -> Result<HttpResponse, PortError> {
+            match self.0 {
+                Ok(status) => Ok(HttpResponse {
+                    status,
+                    body: Vec::new(),
+                }),
+                Err(()) => Err(PortError::Io("offline".into())),
+            }
+        }
+    }
+
+    fn openrouter() -> ProviderId {
+        ProviderId::new("openrouter")
+    }
+
+    #[tokio::test]
+    async fn apply_api_key_stores_and_connects_a_valid_key() {
+        let secrets = MemSecrets::default();
+        let consent = FakeConsent::default();
+        apply_api_key(
+            &secrets,
+            &consent,
+            &FakeHttp(Ok(200)),
+            &openrouter(),
+            "  sk-or-v1-good ",
+        )
+        .await
+        .expect("a valid key is accepted");
+        // Stored under the namespaced keychain key, whitespace-trimmed, and marked connected.
+        assert_eq!(
+            secrets.get("api_key.openrouter").unwrap().as_deref(),
+            Some("sk-or-v1-good")
+        );
+        assert!(consent.is_enabled(&openrouter()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn apply_api_key_rejects_a_bad_key_without_storing_or_connecting() {
+        let secrets = MemSecrets::default();
+        let consent = FakeConsent::default();
+        let err = apply_api_key(
+            &secrets,
+            &consent,
+            &FakeHttp(Ok(401)),
+            &openrouter(),
+            "nope",
+        )
+        .await
+        .expect_err("a rejected key must not connect");
+        assert!(
+            err.to_lowercase().contains("rejected"),
+            "clear error: {err}"
+        );
+        // The safety property (acceptance 4): nothing stored, source not connected.
+        assert_eq!(secrets.get("api_key.openrouter").unwrap(), None);
+        assert!(!consent.is_enabled(&openrouter()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn apply_api_key_fails_closed_when_verification_is_unreachable() {
+        let secrets = MemSecrets::default();
+        let consent = FakeConsent::default();
+        apply_api_key(&secrets, &consent, &FakeHttp(Err(())), &openrouter(), "k")
+            .await
+            .expect_err("an unverifiable key must not connect");
+        assert_eq!(secrets.get("api_key.openrouter").unwrap(), None);
+        assert!(!consent.is_enabled(&openrouter()).unwrap());
+    }
+
+    #[tokio::test]
+    async fn apply_api_key_refuses_a_non_api_key_source() {
+        let secrets = MemSecrets::default();
+        let consent = FakeConsent::default();
+        // claude-code is a LocalLogin source; a 200 fake proves the guard runs *before* (and
+        // instead of) any validation or storage.
+        apply_api_key(
+            &secrets,
+            &consent,
+            &FakeHttp(Ok(200)),
+            &ProviderId::new("claude-code"),
+            "x",
+        )
+        .await
+        .expect_err("local-login sources reject set_api_key");
+        assert!(secrets.0.lock().unwrap().is_empty());
+        assert!(!consent.is_enabled(&ProviderId::new("claude-code")).unwrap());
+    }
+
+    #[tokio::test]
+    async fn apply_api_key_refuses_an_unknown_source() {
+        let secrets = MemSecrets::default();
+        let consent = FakeConsent::default();
+        let err = apply_api_key(
+            &secrets,
+            &consent,
+            &FakeHttp(Ok(200)),
+            &ProviderId::new("ghost"),
+            "x",
+        )
+        .await
+        .expect_err("unknown sources are refused");
+        assert!(err.to_lowercase().contains("unknown"), "clear error: {err}");
+        assert!(secrets.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_api_key_deletes_the_key_and_disconnects() {
+        let secrets = MemSecrets::default();
+        secrets.set("api_key.openrouter", "sk-or-v1-good").unwrap();
+        let consent = FakeConsent::default();
+        consent.set_enabled(&openrouter(), true).unwrap();
+
+        clear_api_key(&secrets, &consent, &openrouter()).expect("removal succeeds");
+        assert_eq!(secrets.get("api_key.openrouter").unwrap(), None);
+        assert!(!consent.is_enabled(&openrouter()).unwrap());
+    }
+
+    #[test]
+    fn clear_api_key_refuses_a_non_api_key_source() {
+        let secrets = MemSecrets::default();
+        let consent = FakeConsent::default();
+        clear_api_key(&secrets, &consent, &ProviderId::new("claude-code"))
+            .expect_err("local-login sources reject remove_api_key");
     }
 }

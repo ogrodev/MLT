@@ -26,3 +26,8 @@ tokio = { version = "1", features = ["time"] }
 mlt-core = { workspace = true }
 mlt-adapters = { workspace = true }
 
+[dev-dependencies]
+# Test-only: async executor + trait macro for the API-key command tests (fakes for the
+# SecretStore / ConsentStore / HttpPort ports). Not pulled into production builds.
+async-trait = { workspace = true }
+tokio = { version = "1", features = ["macros", "rt"] }

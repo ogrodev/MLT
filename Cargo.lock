@@ -2118,6 +2118,7 @@ dependencies = [
 name = "mlt"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "mlt-adapters",
  "mlt-core",
  "tauri",
