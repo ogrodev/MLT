@@ -23,7 +23,7 @@ Each item links to its detailed requirements + acceptance criteria below.
 | ✅ | [Menu-bar app & popover experience](#1-menu-bar-app--popover-experience) | tray + anchored popover, quit, connected state, light/dark — QA'd on macOS install |
 | ✅ | [At-a-glance usage tracking](#2-at-a-glance-usage-tracking) | windows, %, countdowns, auto-refresh (for connected providers) |
 | 🟡 | [Provider coverage](#3-provider-coverage) | Claude Code ✅; Codex / OpenRouter / OpenAI API / Anthropic API ◻ |
-| 🟡 | [Connecting accounts: credentials & consent](#4-connecting-accounts-credentials--consent) | Claude reuse + refresh ✅; source discovery + per-source consent UI ✅; API-key entry, disconnect ◻ |
+| 🟡 | [Connecting accounts: credentials & consent](#4-connecting-accounts-credentials--consent) | Claude reuse + refresh ✅; source discovery + per-source consent UI ✅; API-key entry/replace/remove ✅; disconnect ◻ |
 | ◻ | [Alarms & notifications](#5-alarms--notifications) | threshold + user-defined alarms → OS notifications |
 | ◻ | [Calendar awareness (read-only)](#6-calendar-awareness-read-only) | Google / Outlook / Apple calendars |
 | 🟡 | [Reliability & always-on](#7-reliability--always-on) | resilience + refresh loop ✅; login-item + wake catch-up ◻ |

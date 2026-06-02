@@ -23,3 +23,6 @@ Format: lightweight [MADR](https://adr.github.io/madr/)-style.
 | [0013](./0013-single-tray-icon.md) | Single tray icon, CodexBar-style v0.1 | Accepted |
 | [0014](./0014-v1-provider-set.md) | v1 provider set (5 providers, 2 categories) | Accepted |
 | [0015](./0015-resilience-patterns.md) | Provider resilience patterns are core requirements | Accepted |
+| [0016](./0016-api-key-connection-model.md) | API-key sources: typed credential kind, validate-before-store | Accepted |
+| [0017](./0017-provider-account-identity.md) | Provider account identity: auto-fetched, cached, siloed | Accepted |
+| [0018](./0018-multi-provider-popover.md) | Multi-provider popover: switcher + per-source custom names | Accepted |
