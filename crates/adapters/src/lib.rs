@@ -6,6 +6,7 @@
 
 pub mod claude;
 pub mod clock;
+pub mod codex;
 pub mod consent;
 pub mod http;
 pub mod identity;
@@ -13,8 +14,9 @@ pub mod labels;
 pub mod secrets;
 pub mod sources;
 
-pub use claude::{claude_strategy, detect_user_agent, ClaudeCredentials};
+pub use claude::{claude_strategy, ClaudeCredentials};
 pub use clock::SystemClock;
+pub use codex::{codex_strategy, CodexCredentials};
 pub use consent::FileConsentStore;
 pub use http::ReqwestHttp;
 pub use identity::FileIdentityStore;

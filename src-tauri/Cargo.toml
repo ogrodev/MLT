@@ -25,6 +25,8 @@ tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
 tokio = { version = "1", features = ["time"] }
 mlt-core = { workspace = true }
 mlt-adapters = { workspace = true }
+# Typed payloads for the events emitted to the popover (e.g. the per-provider usage-error).
+serde = { workspace = true }
 
 [dev-dependencies]
 # Test-only: async executor + trait macro for the API-key command tests (fakes for the

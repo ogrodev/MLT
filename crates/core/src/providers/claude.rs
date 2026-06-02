@@ -274,7 +274,10 @@ impl ClaudeCodeStrategy {
     }
 }
 
-// ---- Token refresh -----------------------------------------------------------------------
+// ---- Token refresh config -----------------------------------------------------------------
+//
+// The refresh *logic* is the shared [`crate::providers::oauth::OAuthRefresher`]; these consts
+// are just Claude Code's endpoint / client / cache wiring for it.
 
 /// Anthropic's OAuth token endpoint + the public Claude Code PKCE client id (overridable).
 /// Sourced from research (docs/research/PROVIDERS.md); intentionally NOT live-fire tested,
@@ -283,173 +286,6 @@ pub const DEFAULT_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token"
 pub const DEFAULT_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 /// Key under which we cache OUR refreshed copy — never written back to Claude Code's store.
 pub const CACHE_KEY: &str = "oauth.claude";
-const REFRESH_SKEW_MS: i64 = 60_000;
-
-/// An [`OAuthCredentialSource`] that keeps a valid Claude access token available, refreshing
-/// only when necessary. When Claude Code's own token is fresh it is used as-is — *without even
-/// reading our keychain cache*, so the user isn't prompted by the OS on every refresh — and we
-/// fall back to our cached copy (then a network refresh) only when that token is missing or
-/// stale. Refreshed tokens are stored in OUR `SecretStore`, NEVER written back to Claude
-/// Code's keychain item — so we cannot break the user's Claude Code login.
-pub struct ClaudeOAuthRefresher {
-    bootstrap: Arc<dyn OAuthCredentialSource>,
-    cache: Arc<dyn SecretStore>,
-    http: Arc<dyn HttpPort>,
-    clock: Arc<dyn Clock>,
-    token_url: String,
-    client_id: String,
-}
-
-impl ClaudeOAuthRefresher {
-    pub fn new(
-        bootstrap: Arc<dyn OAuthCredentialSource>,
-        cache: Arc<dyn SecretStore>,
-        http: Arc<dyn HttpPort>,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
-        Self {
-            bootstrap,
-            cache,
-            http,
-            clock,
-            token_url: DEFAULT_TOKEN_URL.to_string(),
-            client_id: DEFAULT_CLIENT_ID.to_string(),
-        }
-    }
-
-    /// Override the token endpoint / client id (env-driven config, or tests).
-    pub fn with_endpoint(
-        mut self,
-        token_url: impl Into<String>,
-        client_id: impl Into<String>,
-    ) -> Self {
-        self.token_url = token_url.into();
-        self.client_id = client_id.into();
-        self
-    }
-
-    fn is_fresh(&self, t: &OAuthTokens) -> bool {
-        match t.expires_at {
-            Some(exp) => exp.0 > self.clock.now().0 + REFRESH_SKEW_MS,
-            None => true,
-        }
-    }
-
-    fn load_cached(&self) -> Option<OAuthTokens> {
-        self.cache
-            .get(CACHE_KEY)
-            .ok()
-            .flatten()
-            .and_then(|s| serde_json::from_str(&s).ok())
-    }
-
-    async fn refresh(&self, base: &OAuthTokens) -> Result<OAuthTokens, PortError> {
-        let refresh_token = base
-            .refresh_token
-            .as_deref()
-            .ok_or_else(|| PortError::Io("token expired and no refresh_token available".into()))?;
-        let body = serde_json::json!({
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": self.client_id,
-        })
-        .to_string();
-        let resp = self
-            .http
-            .send(HttpRequest {
-                method: "POST".into(),
-                url: self.token_url.clone(),
-                headers: vec![("Content-Type".into(), "application/json".into())],
-                body: Some(body.into_bytes()),
-            })
-            .await?;
-        if resp.status != 200 {
-            return Err(PortError::Io(format!(
-                "token refresh failed: HTTP {}",
-                resp.status
-            )));
-        }
-        parse_refresh_response(&resp.body, base, self.clock.now())
-    }
-}
-
-/// Pure parser for the OAuth token response. `base` supplies fallbacks: a rotated refresh
-/// token may be omitted, and scopes/subscription carry over when not returned.
-fn parse_refresh_response(
-    body: &[u8],
-    base: &OAuthTokens,
-    now: Timestamp,
-) -> Result<OAuthTokens, PortError> {
-    let v: serde_json::Value =
-        serde_json::from_slice(body).map_err(|e| PortError::Io(format!("bad token json: {e}")))?;
-    let access_token = v
-        .get("access_token")
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| PortError::Io("no access_token in refresh response".into()))?
-        .to_string();
-    let refresh_token = v
-        .get("refresh_token")
-        .and_then(|x| x.as_str())
-        .map(String::from)
-        .or_else(|| base.refresh_token.clone());
-    let expires_at = v
-        .get("expires_in")
-        .and_then(|x| x.as_i64())
-        .map(|secs| Timestamp(now.0 + secs * 1000));
-    let scopes = v
-        .get("scope")
-        .and_then(|x| x.as_str())
-        .map(|s| s.split(' ').map(String::from).collect::<Vec<_>>())
-        .unwrap_or_else(|| base.scopes.clone());
-    Ok(OAuthTokens {
-        access_token,
-        refresh_token,
-        expires_at,
-        scopes,
-        subscription_type: base.subscription_type.clone(),
-    })
-}
-
-/// Of two optional token sets, keep the one with the later expiry (treating "no expiry" as
-/// far future). Lets us prefer Claude Code's continually-refreshed token over a stale cache.
-fn pick_freshest(a: Option<OAuthTokens>, b: Option<OAuthTokens>) -> Option<OAuthTokens> {
-    match (a, b) {
-        (Some(a), Some(b)) => {
-            let ae = a.expires_at.map(|t| t.0).unwrap_or(i64::MAX);
-            let be = b.expires_at.map(|t| t.0).unwrap_or(i64::MAX);
-            Some(if ae >= be { a } else { b })
-        }
-        (Some(only), None) | (None, Some(only)) => Some(only),
-        (None, None) => None,
-    }
-}
-
-#[async_trait]
-impl OAuthCredentialSource for ClaudeOAuthRefresher {
-    async fn load(&self) -> Result<OAuthTokens, PortError> {
-        let bootstrap = self.bootstrap.load().await.ok();
-        // Fast path: Claude Code keeps its own token fresh, and on most setups it lives in a
-        // plaintext file (no keychain). When it's fresh, return it directly and never read our
-        // keychain cache — that read is what pops a macOS keychain prompt on every refresh.
-        match bootstrap {
-            Some(token) if self.is_fresh(&token) => Ok(token),
-            // Vendor token stale or absent → consult our cached refreshed copy (a keychain
-            // read), prefer whichever is freshest, and refresh only as a last resort.
-            bootstrap => {
-                let chosen =
-                    pick_freshest(self.load_cached(), bootstrap).ok_or(PortError::NotFound)?;
-                if self.is_fresh(&chosen) {
-                    return Ok(chosen);
-                }
-                let refreshed = self.refresh(&chosen).await?;
-                if let Ok(json) = serde_json::to_string(&refreshed) {
-                    let _ = self.cache.set(CACHE_KEY, &json);
-                }
-                Ok(refreshed)
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -528,21 +364,6 @@ mod tests {
             Timestamp(self.0)
         }
     }
-    #[derive(Default)]
-    struct MemSecrets(Mutex<HashMap<String, String>>);
-    impl SecretStore for MemSecrets {
-        fn get(&self, k: &str) -> Result<Option<String>, PortError> {
-            Ok(self.0.lock().unwrap().get(k).cloned())
-        }
-        fn set(&self, k: &str, v: &str) -> Result<(), PortError> {
-            self.0.lock().unwrap().insert(k.into(), v.into());
-            Ok(())
-        }
-        fn delete(&self, k: &str) -> Result<(), PortError> {
-            self.0.lock().unwrap().remove(k);
-            Ok(())
-        }
-    }
 
     #[derive(Default)]
     struct FakeIdentity(Mutex<HashMap<String, AccountIdentity>>);
@@ -577,6 +398,7 @@ mod tests {
             expires_at: Some(Timestamp(exp)),
             scopes: vec!["user:profile".into(), "user:inference".into()],
             subscription_type: Some("team".into()),
+            account_id: None,
         }
     }
 
@@ -720,107 +542,5 @@ mod tests {
             1,
             "profile fetched at most once"
         );
-    }
-
-    // ---- refresher ----
-    #[tokio::test]
-    async fn refresher_uses_fresh_token_without_calling_http() {
-        let http = Arc::new(FakeHttp::new(200, "{}"));
-        let refresher = ClaudeOAuthRefresher::new(
-            Arc::new(FakeCreds(Some(tokens_expiring_at(10_000_000)))), // far ahead of clock
-            Arc::new(MemSecrets::default()),
-            http.clone(),
-            Arc::new(FakeClock(1_000)),
-        );
-        let t = refresher.load().await.unwrap();
-        assert_eq!(t.access_token, "old-access");
-        assert_eq!(
-            http.calls.load(Ordering::SeqCst),
-            0,
-            "must not refresh a fresh token"
-        );
-    }
-
-    #[tokio::test]
-    async fn refresher_refreshes_expired_token_and_caches_it() {
-        let cache = Arc::new(MemSecrets::default());
-        let body = r#"{"access_token":"new-access","refresh_token":"rt-new","expires_in":3600,
-            "scope":"user:profile user:inference"}"#;
-        let http = Arc::new(FakeHttp::new(200, body));
-        let refresher = ClaudeOAuthRefresher::new(
-            Arc::new(FakeCreds(Some(tokens_expiring_at(500)))), // expired vs clock 1000
-            cache.clone(),
-            http.clone(),
-            Arc::new(FakeClock(1_000)),
-        );
-        let t = refresher.load().await.unwrap();
-        assert_eq!(t.access_token, "new-access");
-        assert_eq!(t.refresh_token.as_deref(), Some("rt-new"));
-        assert_eq!(t.expires_at, Some(Timestamp(1_000 + 3_600_000)));
-        assert_eq!(http.calls.load(Ordering::SeqCst), 1);
-        assert!(
-            cache.get(CACHE_KEY).unwrap().is_some(),
-            "refreshed token must be cached"
-        );
-    }
-
-    #[tokio::test]
-    async fn refresher_errors_when_expired_with_no_refresh_token() {
-        let mut tk = tokens_expiring_at(500);
-        tk.refresh_token = None;
-        let refresher = ClaudeOAuthRefresher::new(
-            Arc::new(FakeCreds(Some(tk))),
-            Arc::new(MemSecrets::default()),
-            Arc::new(FakeHttp::new(200, "{}")),
-            Arc::new(FakeClock(1_000)),
-        );
-        assert!(refresher.load().await.is_err());
-    }
-
-    #[tokio::test]
-    async fn refresher_prefers_the_freshest_source() {
-        // cache holds a fresh token; bootstrap is expired → cache wins, no refresh.
-        let cache = Arc::new(MemSecrets::default());
-        let mut cached = tokens_expiring_at(10_000_000);
-        cached.access_token = "cached-fresh".into();
-        cache
-            .set(CACHE_KEY, &serde_json::to_string(&cached).unwrap())
-            .unwrap();
-        let http = Arc::new(FakeHttp::new(200, "{}"));
-        let refresher = ClaudeOAuthRefresher::new(
-            Arc::new(FakeCreds(Some(tokens_expiring_at(500)))),
-            cache,
-            http.clone(),
-            Arc::new(FakeClock(1_000)),
-        );
-        let t = refresher.load().await.unwrap();
-        assert_eq!(t.access_token, "cached-fresh");
-        assert_eq!(http.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn refresher_skips_the_cache_when_the_vendor_token_is_fresh() {
-        // Reading our keychain cache is what pops a macOS keychain prompt. When Claude Code's
-        // own token is fresh, the refresher must use it and never touch the cache at all.
-        struct ForbiddenCache;
-        impl SecretStore for ForbiddenCache {
-            fn get(&self, _k: &str) -> Result<Option<String>, PortError> {
-                panic!("must not read the keychain cache when the vendor token is fresh");
-            }
-            fn set(&self, _k: &str, _v: &str) -> Result<(), PortError> {
-                panic!("must not write the keychain cache when the vendor token is fresh");
-            }
-            fn delete(&self, _k: &str) -> Result<(), PortError> {
-                Ok(())
-            }
-        }
-        let refresher = ClaudeOAuthRefresher::new(
-            Arc::new(FakeCreds(Some(tokens_expiring_at(10_000_000)))), // fresh vs clock 1000
-            Arc::new(ForbiddenCache),
-            Arc::new(FakeHttp::new(200, "{}")),
-            Arc::new(FakeClock(1_000)),
-        );
-        let t = refresher.load().await.unwrap();
-        assert_eq!(t.access_token, "old-access");
     }
 }

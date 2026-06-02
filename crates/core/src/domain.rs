@@ -113,6 +113,11 @@ pub struct OAuthTokens {
     pub expires_at: Option<Timestamp>,
     pub scopes: Vec<String>,
     pub subscription_type: Option<String>,
+    /// OpenAI account id for providers (e.g. Codex) that send a `ChatGPT-Account-Id` header.
+    /// Read from the vendor credential store; `None` for providers without one. `#[serde(default)]`
+    /// so an older cached token (written before this field existed) still deserializes.
+    #[serde(default)]
+    pub account_id: Option<String>,
 }
 
 #[cfg(test)]

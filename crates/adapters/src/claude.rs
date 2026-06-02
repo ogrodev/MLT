@@ -12,7 +12,10 @@ use mlt_core::domain::{OAuthTokens, Timestamp};
 use mlt_core::ports::{
     Clock, HttpPort, IdentityStore, OAuthCredentialSource, PortError, SecretStore,
 };
-use mlt_core::providers::claude::{ClaudeCodeStrategy, ClaudeOAuthRefresher};
+use mlt_core::providers::claude::{
+    ClaudeCodeStrategy, CACHE_KEY, DEFAULT_CLIENT_ID, DEFAULT_TOKEN_URL,
+};
+use mlt_core::providers::oauth::OAuthRefresher;
 
 use crate::{KeyringSecretStore, ReqwestHttp, SystemClock, KEYCHAIN_SERVICE};
 
@@ -111,6 +114,8 @@ fn parse_creds(raw: &str) -> Result<OAuthTokens, String> {
         expires_at,
         scopes,
         subscription_type,
+        // Claude Code's credentials carry no OpenAI-style account id.
+        account_id: None,
     })
 }
 
@@ -181,11 +186,14 @@ pub fn claude_strategy(identity: Arc<dyn IdentityStore>) -> ClaudeCodeStrategy {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let bootstrap: Arc<dyn OAuthCredentialSource> = Arc::new(ClaudeCredentials);
     let cache: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore::new(KEYCHAIN_SERVICE));
-    let creds: Arc<dyn OAuthCredentialSource> = Arc::new(ClaudeOAuthRefresher::new(
+    let creds: Arc<dyn OAuthCredentialSource> = Arc::new(OAuthRefresher::new(
         bootstrap,
         cache,
         http.clone(),
         clock.clone(),
+        DEFAULT_TOKEN_URL,
+        DEFAULT_CLIENT_ID,
+        CACHE_KEY,
     ));
     ClaudeCodeStrategy {
         creds,

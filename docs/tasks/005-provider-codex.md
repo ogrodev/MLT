@@ -2,7 +2,7 @@
 
 > Connect my Codex subscription and see its usage windows next to Claude's.
 
-**Capability:** [§3 Provider coverage](../PRD.md#3-provider-coverage) · **Status:** ◻ not started · **Depends on:** 002
+**Capability:** [§3 Provider coverage](../PRD.md#3-provider-coverage) · **Status:** ✅ done · **Depends on:** 002
 
 ## User story
 As a Codex subscriber, I want my Codex usage tracked the same way Claude's is, so the number
@@ -14,13 +14,13 @@ reflects my real coding usage across tools.
 - **Out:** API-key providers (006–008); alarms on this data (009).
 
 ## Acceptance criteria
-- [ ] Once connected, Codex shows its **usage windows** with **percent used** and a
+- [x] Once connected, Codex shows its **usage windows** with **percent used** and a
       **human countdown to reset**, per §2.
-- [ ] Data **auto-refreshes** with the rest and on opening the popover.
-- [ ] If Codex data can't be fetched, the tile shows a **stale/error** state and keeps the
+- [x] Data **auto-refreshes** with the rest and on opening the popover.
+- [x] If Codex data can't be fetched, the tile shows a **stale/error** state and keeps the
       last known values — other providers are unaffected.
-- [ ] Codex identity/plan is shown **only** under Codex (provider data stays siloed).
-- [ ] Adding Codex **does not change** the appearance or behaviour of existing providers.
+- [x] Codex identity/plan is shown **only** under Codex (provider data stays siloed).
+- [x] Adding Codex **does not change** the appearance or behaviour of existing providers.
 
 ## Done
 Meets the [shared Definition of Done](./README.md#shared-definition-of-done-applies-to-every-task).

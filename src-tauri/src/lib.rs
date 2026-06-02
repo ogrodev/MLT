@@ -76,22 +76,32 @@ fn popover_action(
     }
 }
 
-/// Fetch the current Claude Code subscription usage on demand (called by the UI on open).
-/// Gated on consent: the secret is read only when the source is opted in *and* present, so a
-/// stray call can never read credentials the user hasn't connected (ADR 0012).
+/// Fetch a connected provider's usage on demand (called by the UI on open). Gated on consent:
+/// the secret is read only when the source is connected per its credential kind (the
+/// [`active_sources`] gate — ADR 0012), so a stray call can never read credentials the user
+/// hasn't opted into. An error is returned for a disconnected source or one with no usage
+/// fetch wired yet, so the UI can show it on that provider's tile alone.
 #[tauri::command]
-async fn fetch_claude_usage(
+async fn fetch_usage(
     sources: tauri::State<'_, AppSources>,
+    id: String,
 ) -> Result<UsageSnapshot, String> {
-    let id = ProviderId::new("claude-code");
-    let connected = sources.consent.is_enabled(&id).map_err(|e| e.to_string())?
-        && sources.probe.is_present(&id).await;
+    let provider = ProviderId::new(&id);
+    let connected = active_sources(
+        &source_catalog(),
+        sources.probe.as_ref(),
+        sources.consent.as_ref(),
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    .contains(&provider);
     if !connected {
-        return Err("Claude Code is not connected".into());
+        return Err(format!("{id} is not connected"));
     }
-    claude_usage(sources.identity.clone())
-        .await
-        .map_err(|e| e.to_string())
+    match fetch_for(&provider, sources.identity.clone()).await {
+        Some(result) => result.map_err(|e| e.to_string()),
+        None => Err(format!("{id} does not report usage yet")),
+    }
 }
 
 /// Discover every known source for the connect screen: presence (metadata only) + the user's
@@ -328,6 +338,16 @@ async fn claude_usage(
     strategy.fetch(&ctx).await
 }
 
+async fn codex_usage(
+    identity: Arc<dyn IdentityStore>,
+) -> Result<UsageSnapshot, mlt_core::providers::FetchError> {
+    let strategy = mlt_adapters::codex_strategy(identity);
+    let ctx = FetchContext {
+        provider: ProviderId::new("codex"),
+    };
+    strategy.fetch(&ctx).await
+}
+
 /// Fetch one source's usage, or `None` for a source with no fetch wired yet. The map of
 /// id → fetcher is the single place a connected source becomes a network call.
 async fn fetch_for(
@@ -336,8 +356,18 @@ async fn fetch_for(
 ) -> Option<Result<UsageSnapshot, mlt_core::providers::FetchError>> {
     match id.as_str() {
         "claude-code" => Some(claude_usage(identity).await),
+        "codex" => Some(codex_usage(identity).await),
         _ => None,
     }
+}
+
+/// Payload for the `usage-error` event: which provider failed, and why. Carrying the provider
+/// id lets the popover show the error on *that* provider's tile only — other providers keep
+/// their last-known values, unaffected (PRD §2; task 005 AC).
+#[derive(Clone, serde::Serialize)]
+struct UsageErrorEvent {
+    provider: String,
+    message: String,
 }
 
 /// Refresh every *active* source (opted-in and present) and emit the result for the popover.
@@ -358,7 +388,13 @@ async fn refresh_active(
                 let _ = app.emit("usage-updated", snapshot);
             }
             Some(Err(e)) => {
-                let _ = app.emit("usage-error", e.to_string());
+                let _ = app.emit(
+                    "usage-error",
+                    UsageErrorEvent {
+                        provider: id.as_str().to_string(),
+                        message: e.to_string(),
+                    },
+                );
             }
             None => {}
         }
@@ -423,7 +459,7 @@ pub fn run() {
         .plugin(tauri_plugin_positioner::init())
         .manage(PopoverState::default())
         .invoke_handler(tauri::generate_handler![
-            fetch_claude_usage,
+            fetch_usage,
             list_sources,
             set_source_enabled,
             set_api_key,

@@ -2,7 +2,7 @@
 import { onMount } from 'svelte';
 import {
   disconnectSource,
-  fetchClaudeUsage,
+  fetchUsage,
   listSources,
   onUsageError,
   onUsageUpdated,
@@ -17,9 +17,11 @@ import {
 } from '$lib/usage';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
-let snapshot = $state<UsageSnapshot | null>(null);
-let error = $state<string | null>(null);
-let loading = $state(true);
+// Usage snapshot and last error keyed by provider id. Per-provider so each tile shows only its
+// own data: a failure (or stale data) for one provider never blanks or overwrites another's
+// (provider data stays siloed — an MLT invariant).
+let snapshots = $state<Record<string, UsageSnapshot>>({});
+let errors = $state<Record<string, string>>({});
 let now = $state(Date.now());
 let sources = $state<SourceState[]>([]);
 let view = $state<'usage' | 'sources'>('usage');
@@ -69,6 +71,12 @@ function sourceActive(s: SourceState): boolean {
   return s.credential === 'ApiKey' ? s.enabled : s.present && s.enabled;
 }
 
+// Providers with a usage fetch wired in the backend (mirrors src-tauri's `fetch_for` map).
+// A connected provider not in this set (e.g. OpenRouter) shows an honest "usage coming"
+// placeholder rather than fabricated bars (ADR 0015/0018).
+const USAGE_PROVIDERS = new Set(['claude-code', 'codex']);
+const reportsUsage = (id: string): boolean => USAGE_PROVIDERS.has(id);
+
 // Connected providers and the one currently shown. The shown provider falls back to Claude,
 // then the first connected source, so a stale or empty `selectedId` never blanks the view.
 const activeSources = $derived(sources.filter(sourceActive));
@@ -78,23 +86,28 @@ const selected = $derived.by(() => {
   return pick ?? activeSources.find((s) => s.id === 'claude-code') ?? activeSources[0];
 });
 
+// The selected provider's own usage + error. Reading them by `selected.id` is what keeps the
+// panel siloed: it can only ever show the chosen provider's data, never another's.
+const selSnap = $derived(selected ? (snapshots[selected.id] ?? null) : null);
+const selErr = $derived(selected ? (errors[selected.id] ?? null) : null);
+
 // The account identifier (email, else org) for the *selected* provider, shown as a subtitle.
 // Prefer the live snapshot's identity, but only for the same provider — never render one
 // provider's identity under another — then fall back to the cached identity on the row.
 const selectedEmail = $derived.by((): string | null => {
   if (!selected) return null;
-  if (snapshot && snapshot.provider === selected.id && snapshot.account) {
-    return snapshot.account.email ?? snapshot.account.organization;
+  if (selSnap?.account) {
+    return selSnap.account.email ?? selSnap.account.organization;
   }
   return selected.account?.email ?? selected.account?.organization ?? null;
 });
 
 const conn = $derived.by((): { label: string; tone: Tone } => {
   if (!selected) return { label: 'Not connected', tone: 'idle' };
-  // Only Claude reports usage today; any other connected source is simply "Connected".
-  if (selected.id !== 'claude-code') return { label: 'Connected', tone: 'ok' };
-  if (snapshot) return STATUS_CONN[snapshot.status];
-  if (error) return { label: 'Disconnected', tone: 'err' };
+  // A connected provider with no usage endpoint yet is simply "Connected".
+  if (!reportsUsage(selected.id)) return { label: 'Connected', tone: 'ok' };
+  if (selSnap) return STATUS_CONN[selSnap.status];
+  if (selErr) return { label: 'Disconnected', tone: 'err' };
   return { label: 'Connecting…', tone: 'idle' };
 });
 
@@ -130,17 +143,15 @@ function lastUpdated(ms: number): string {
 async function toggleSource(source: SourceState, enabled: boolean): Promise<void> {
   try {
     sources = await setSourceEnabled(source.id, enabled);
-    error = null;
-    if (enabled && source.present && !snapshot) {
-      // Awaiting the backend's kick-off fetch — unless a usage event already raced in and
-      // populated the snapshot, in which case flipping to "loading" would mask live data.
-      loading = true;
-    } else if (!sources.some((s) => s.id === 'claude-code' && sourceActive(s))) {
-      snapshot = null; // nothing connected anymore — drop the disconnected usage
-      loading = false;
+    if (!enabled) {
+      // Disconnected → drop its usage/error so a later reconnect starts clean and nothing
+      // lingers. Other providers' entries are untouched.
+      delete snapshots[source.id];
+      delete errors[source.id];
     }
+    // On enable the backend kicks a refresh; a usage-updated/usage-error event fills the tile.
   } catch (e) {
-    error = String(e);
+    errors[source.id] = String(e);
   }
 }
 
@@ -210,29 +221,31 @@ onMount(() => {
   listSources()
     .then((discovered) => {
       sources = discovered;
-      // Only read a credential when a source is actually connected.
-      if (discovered.some((s) => s.id === 'claude-code' && sourceActive(s))) {
-        return fetchClaudeUsage().then((s) => {
-          snapshot = s;
-          error = null;
-        });
-      }
+      // Fetch each connected, usage-reporting provider once on open — siloed per provider, and
+      // never reading a credential for a source the user hasn't connected.
+      return Promise.all(
+        discovered
+          .filter((s) => sourceActive(s) && reportsUsage(s.id))
+          .map((s) =>
+            fetchUsage(s.id)
+              .then((snap) => {
+                snapshots[snap.provider] = snap;
+                delete errors[snap.provider];
+              })
+              .catch((e) => {
+                errors[s.id] = String(e);
+              }),
+          ),
+      );
     })
-    .catch((e) => {
-      error = String(e);
-    })
-    .finally(() => {
-      loading = false;
-    });
+    .catch(() => {});
 
   onUsageUpdated((s) => {
-    snapshot = s;
-    error = null;
-    loading = false;
+    snapshots[s.provider] = s;
+    delete errors[s.provider];
   }).then((u) => unlisteners.push(u));
-  onUsageError((msg) => {
-    error = msg;
-    loading = false;
+  onUsageError((e) => {
+    errors[e.provider] = e.message;
   }).then((u) => unlisteners.push(u));
 
   // Re-discover whenever the popover regains focus (i.e. each time it's opened), so presence
@@ -569,7 +582,7 @@ onMount(() => {
         </div>
       {/if}
 
-      {#if selected && selected.id !== 'claude-code'}
+      {#if selected && !reportsUsage(selected.id)}
         <div class="mt-8 text-center">
           <p class="text-sm text-neutral-700 dark:text-neutral-300">
             {selected.display_name} is connected
@@ -578,18 +591,9 @@ onMount(() => {
             Usage tracking for this provider is coming in a later update.
           </p>
         </div>
-      {:else if loading}
-        <p class="mt-10 text-center text-sm text-neutral-500 dark:text-neutral-400">
-          Loading usage…
-        </p>
-      {:else if error && !snapshot}
-        <div class="mt-8 text-center">
-          <p class="text-sm text-red-600 dark:text-red-400">Couldn't load usage</p>
-          <p class="mt-2 text-[11px] break-words text-neutral-500 dark:text-neutral-400">{error}</p>
-        </div>
-      {:else if snapshot}
+      {:else if selSnap}
         <ul class="space-y-4">
-          {#each snapshot.windows as w (w.kind + (w.reset_description ?? ''))}
+          {#each selSnap.windows as w (w.kind + (w.reset_description ?? ''))}
             <li>
               <div class="mb-1 flex items-baseline justify-between">
                 <span class="text-[13px] font-medium text-neutral-800 dark:text-neutral-200"
@@ -613,11 +617,20 @@ onMount(() => {
             </li>
           {/each}
         </ul>
-        {#if error}
+        {#if selErr}
           <p class="mt-4 text-center text-[11px] text-amber-600 dark:text-amber-400">
-            stale · {error}
+            stale · {selErr}
           </p>
         {/if}
+      {:else if selErr}
+        <div class="mt-8 text-center">
+          <p class="text-sm text-red-600 dark:text-red-400">Couldn't load usage</p>
+          <p class="mt-2 text-[11px] break-words text-neutral-500 dark:text-neutral-400">{selErr}</p>
+        </div>
+      {:else}
+        <p class="mt-10 text-center text-sm text-neutral-500 dark:text-neutral-400">
+          Loading usage…
+        </p>
       {/if}
     {/if}
   </section>
@@ -626,8 +639,8 @@ onMount(() => {
     class="flex items-center justify-between border-t border-neutral-200 px-4 py-2 text-[11px] text-neutral-500 dark:border-neutral-800 dark:text-neutral-400"
   >
     <span>
-      {#if selected?.id === 'claude-code' && snapshot}
-        Updated {lastUpdated(snapshot.fetched_at)}
+      {#if selSnap}
+        Updated {lastUpdated(selSnap.fetched_at)}
       {:else}
         MLT
       {/if}

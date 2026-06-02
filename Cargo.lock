@@ -2121,6 +2121,7 @@ dependencies = [
  "async-trait",
  "mlt-adapters",
  "mlt-core",
+ "serde",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
@@ -2147,6 +2148,7 @@ name = "mlt-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "parking_lot",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

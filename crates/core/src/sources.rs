@@ -129,6 +129,18 @@ pub fn source_catalog() -> Vec<SourceDescriptor> {
             oauth_cache_key: Some(crate::providers::claude::CACHE_KEY),
         },
         SourceDescriptor {
+            id: ProviderId::new("codex"),
+            display_name: "Codex",
+            access_note: "Reuses your Codex login — the OAuth token the Codex CLI keeps in \
+                          ~/.codex/auth.json — to read your ChatGPT subscription's Codex usage. \
+                          The token is never shown, never stored in MLT's database or logs, and \
+                          is sent only to OpenAI.",
+            credential: CredentialKind::LocalLogin,
+            // Our refreshed-OAuth copy lives here; disconnect purges it. Never the Codex CLI's
+            // own ~/.codex/auth.json, which we only read.
+            oauth_cache_key: Some(crate::providers::codex::CACHE_KEY),
+        },
+        SourceDescriptor {
             id: ProviderId::new("openrouter"),
             display_name: "OpenRouter",
             access_note: "Uses an OpenRouter API key you paste in to read your API usage and \
@@ -314,6 +326,30 @@ mod tests {
         // The note must disclose the credential read before opt-in, not be a placeholder.
         assert!(claude.access_note.contains("OAuth"));
         assert!(claude.access_note.to_lowercase().contains("anthropic"));
+    }
+
+    #[test]
+    fn catalog_ships_codex_as_a_reused_login_with_an_honest_disclosure() {
+        let catalog = source_catalog();
+        let codex = find_source(&catalog, &ProviderId::new("codex")).expect("codex in catalog");
+        assert_eq!(codex.credential, CredentialKind::LocalLogin);
+        assert_eq!(codex.display_name, "Codex");
+        // Discloses the reused login + where data goes, before opt-in.
+        let note = codex.access_note.to_lowercase();
+        assert!(
+            note.contains("oauth") || note.contains("login"),
+            "names the reused credential"
+        );
+        assert!(
+            note.contains("openai"),
+            "discloses where usage data is sent"
+        );
+        // Caches OUR refreshed copy under our own oauth.* namespace — what disconnect purges.
+        assert_eq!(
+            codex.cached_secret_keys(),
+            vec![crate::providers::codex::CACHE_KEY.to_string()]
+        );
+        assert!(crate::providers::codex::CACHE_KEY.starts_with("oauth."));
     }
 
     #[tokio::test]

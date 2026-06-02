@@ -20,3 +20,6 @@ time = { version = "0.3", features = ["parsing"] }
 # so the no-IO invariant holds). Production core never depends on a runtime.
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }
+# Poison-free locks for in-memory test fakes (see the rs-parking-lot rule). Test-only, so the
+# no-IO invariant on production `core` is untouched.
+parking_lot = "0.12"
