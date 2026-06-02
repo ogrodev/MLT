@@ -4,13 +4,18 @@
 //!   cargo run -p mlt-adapters --example claude_live
 //!
 //! A macOS Keychain prompt may appear the first time — click "Always Allow".
-use mlt_adapters::claude_strategy;
+use mlt_adapters::{claude_strategy, FileIdentityStore};
 use mlt_core::domain::ProviderId;
 use mlt_core::providers::{FetchContext, FetchStrategy};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
-    let strategy = claude_strategy();
+    // Cache identity to a throwaway temp file so re-runs print the email without re-fetching.
+    let identity = Arc::new(FileIdentityStore::load(
+        std::env::temp_dir().join("mlt-claude-live-identity.json"),
+    ));
+    let strategy = claude_strategy(identity);
     let ctx = FetchContext {
         provider: ProviderId::new("claude-code"),
     };

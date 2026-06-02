@@ -65,12 +65,36 @@ impl UsageWindow {
     }
 }
 
+/// A provider account's identity, fetched **from the provider** (never user-entered) so the
+/// user can tell *which* account a panel reports. Display-only — it plays no part in auth or
+/// consent — and siloed per provider (never rendered under another; see AGENTS.md). Lossy
+/// (ADR 0015): any field the provider omits stays `None`, and an all-`None` identity is simply
+/// not shown.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AccountIdentity {
+    /// The account's email address (e.g. Anthropic's OAuth profile). The primary identifier.
+    pub email: Option<String>,
+    /// The account's organization/team name when the provider exposes one — shown as a
+    /// fallback identifier when there is no email.
+    pub organization: Option<String>,
+}
+
+impl AccountIdentity {
+    /// Nothing worth showing — neither an email nor an organization was resolved.
+    pub fn is_empty(&self) -> bool {
+        self.email.is_none() && self.organization.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageSnapshot {
     pub provider: ProviderId,
     pub windows: Vec<UsageWindow>,
     pub status: Status,
     pub fetched_at: Timestamp,
+    /// Which account this snapshot reports, for display (email/org), or `None` when unknown.
+    /// Provider-fetched, never user-entered; siloed per provider.
+    pub account: Option<AccountIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

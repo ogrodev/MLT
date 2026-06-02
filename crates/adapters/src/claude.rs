@@ -9,7 +9,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use mlt_core::domain::{OAuthTokens, Timestamp};
-use mlt_core::ports::{Clock, HttpPort, OAuthCredentialSource, PortError, SecretStore};
+use mlt_core::ports::{
+    Clock, HttpPort, IdentityStore, OAuthCredentialSource, PortError, SecretStore,
+};
 use mlt_core::providers::claude::{ClaudeCodeStrategy, ClaudeOAuthRefresher};
 
 use crate::{KeyringSecretStore, ReqwestHttp, SystemClock, KEYCHAIN_SERVICE};
@@ -174,7 +176,7 @@ pub fn detect_user_agent() -> String {
 /// Build a ready-to-run Claude Code strategy wired with the real adapters. Credentials flow
 /// through the refresher: it reuses Claude Code's live token when fresh and only refreshes
 /// (caching into OUR keychain, never Claude Code's) when that token has expired.
-pub fn claude_strategy() -> ClaudeCodeStrategy {
+pub fn claude_strategy(identity: Arc<dyn IdentityStore>) -> ClaudeCodeStrategy {
     let http: Arc<dyn HttpPort> = Arc::new(ReqwestHttp::new());
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let bootstrap: Arc<dyn OAuthCredentialSource> = Arc::new(ClaudeCredentials);
@@ -190,6 +192,7 @@ pub fn claude_strategy() -> ClaudeCodeStrategy {
         http,
         clock,
         user_agent: detect_user_agent(),
+        identity,
     }
 }
 

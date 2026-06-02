@@ -55,6 +55,9 @@ time context. It is **local-first**: no server, no account, data stays on the de
 | 13 | Tray model | Single tray icon; mirror CodexBar UX as v0.1 | [0013](./adr/0013-single-tray-icon.md) |
 | 14 | v1 providers | Codex, Claude Code, OpenRouter, OpenAI API, Anthropic API | [0014](./adr/0014-v1-provider-set.md) |
 | 15 | Resilience | Lossy decode, backfill, failure-gate, timeout, rate-limit gate — in core | [0015](./adr/0015-resilience-patterns.md) |
+| 16 | API-key connection | Typed `CredentialKind`; validate-before-store, keychain-only | [0016](./adr/0016-api-key-connection-model.md) |
+| 17 | Account identity | Auto-fetch provider email (cached once, siloed); label is a custom title | [0017](./adr/0017-provider-account-identity.md) |
+| 18 | Multi-provider UI | Popover switcher (icon + provider name) + per-source custom title | [0018](./adr/0018-multi-provider-popover.md) |
 
 > **Provider reality:** see [research/PROVIDERS.md](../research/PROVIDERS.md). Headline: API
 > cost for Anthropic/OpenAI needs org **admin keys** most individuals can't get (OpenRouter
