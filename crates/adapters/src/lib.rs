@@ -4,17 +4,22 @@
 //! (clock, http, keychain, …) touches the outside world, behind a core port.
 //! See `docs/adr/0006-hexagonal-core.md`.
 
+pub mod accounts;
 pub mod claude;
 pub mod clock;
+pub mod codex;
 pub mod consent;
 pub mod http;
 pub mod identity;
 pub mod labels;
+pub(crate) mod resilience;
 pub mod secrets;
 pub mod sources;
 
-pub use claude::{claude_strategy, detect_user_agent, ClaudeCredentials};
+pub use accounts::discovered_accounts;
+pub use claude::{claude_account_strategy, claude_strategy, ClaudeCredentials};
 pub use clock::SystemClock;
+pub use codex::codex_strategy;
 pub use consent::FileConsentStore;
 pub use http::ReqwestHttp;
 pub use identity::FileIdentityStore;
@@ -24,3 +29,6 @@ pub use sources::LocalSourceProbe;
 
 /// Keychain service name under which MLT stores its own secrets.
 pub const KEYCHAIN_SERVICE: &str = "com.bigshotpictures.mlt";
+
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());

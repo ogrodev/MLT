@@ -15,6 +15,10 @@ dirs = "5"
 # In-process Mutex for the consent cache. parking_lot (already in the tree via tauri) gives
 # poison-free guards, so lock sites read as locking, not error handling.
 parking_lot = "0.12"
+# Read-only access to Oh My Pi's per-profile SQLite credential store to discover Codex logins.
+# `bundled` compiles SQLite in, so there is no system-libsqlite dependency on any platform.
+rusqlite = { version = "0.32", features = ["bundled"] }
+toml = "0.8"
 
 # OS keychain for OUR secrets (refreshed tokens), per-OS backend so the workspace builds
 # cross-platform (incl. Linux/Windows CI). Runtime keychain access is only exercised by the

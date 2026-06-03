@@ -14,6 +14,7 @@
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "tauri": "tauri",
     "lint": "biome ci .",
+    "test": "vitest run",
     "format": "biome check --write ."
   },
   "private": true,
@@ -35,6 +36,7 @@
     "svelte-check": "^4.0.0",
     "tailwindcss": "^4.3.0",
     "typescript": "~5.6.2",
-    "vite": "^6.0.3"
+    "vite": "^6.0.3",
+    "vitest": "^4.1.8"
   }
 }

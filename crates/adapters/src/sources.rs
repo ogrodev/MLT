@@ -20,6 +20,8 @@ impl SourceProbe for LocalSourceProbe {
     async fn is_present(&self, id: &ProviderId) -> bool {
         match id.as_str() {
             "claude-code" => ClaudeCredentials::is_present(),
+            // Codex logins are discovered per-account from Oh My Pi's store / the Codex CLI
+            // (see `crate::codex::codex_accounts`), so they are present by discovery, not probed.
             _ => false,
         }
     }

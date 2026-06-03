@@ -50,7 +50,9 @@ export interface SourceState {
   account: AccountIdentity | null;
 }
 
-export const fetchClaudeUsage = (): Promise<UsageSnapshot> => invoke('fetch_claude_usage');
+// Fetch a connected provider's usage on demand, by id. The backend gates on consent, so it
+// only ever reads a source the user has actually connected. Used to populate the popover on open.
+export const fetchUsage = (id: string): Promise<UsageSnapshot> => invoke('fetch_usage', { id });
 
 // Quit the whole app (the tray right-click menu offers the same action).
 export const quitApp = (): Promise<void> => invoke('quit');
@@ -81,5 +83,12 @@ export const setSourceLabel = (id: string, name: string): Promise<SourceState[]>
 export const onUsageUpdated = (cb: (s: UsageSnapshot) => void): Promise<UnlistenFn> =>
   listen<UsageSnapshot>('usage-updated', (e) => cb(e.payload));
 
-export const onUsageError = (cb: (msg: string) => void): Promise<UnlistenFn> =>
-  listen<string>('usage-error', (e) => cb(e.payload));
+// Payload of the `usage-error` event: which provider failed, and why. The provider id lets the
+// UI show the error on that provider's tile only, leaving other providers' data untouched.
+export interface UsageErrorEvent {
+  provider: string;
+  message: string;
+}
+
+export const onUsageError = (cb: (e: UsageErrorEvent) => void): Promise<UnlistenFn> =>
+  listen<UsageErrorEvent>('usage-error', (e) => cb(e.payload));

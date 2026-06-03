@@ -40,7 +40,7 @@ pub struct SourceDescriptor {
     /// disconnect — it is OUR copy, never the vendor's own credential store, which MLT only
     /// ever reads (ADR 0012). API-key sources leave this `None`: their secret is the
     /// user-entered key at [`api_key_secret_key`].
-    pub oauth_cache_key: Option<&'static str>,
+    pub oauth_cache_key: Option<String>,
 }
 
 impl SourceDescriptor {
@@ -69,8 +69,8 @@ impl SourceDescriptor {
         if self.credential == CredentialKind::ApiKey {
             keys.push(api_key_secret_key(&self.id));
         }
-        if let Some(oauth) = self.oauth_cache_key {
-            keys.push(oauth.to_string());
+        if let Some(oauth) = &self.oauth_cache_key {
+            keys.push(oauth.clone());
         }
         keys
     }
@@ -126,7 +126,7 @@ pub fn source_catalog() -> Vec<SourceDescriptor> {
             credential: CredentialKind::LocalLogin,
             // Our refreshed-OAuth copy lives here; disconnect purges it. Never Claude Code's
             // own keychain item, which we only read.
-            oauth_cache_key: Some(crate::providers::claude::CACHE_KEY),
+            oauth_cache_key: Some(crate::providers::claude::CACHE_KEY.to_string()),
         },
         SourceDescriptor {
             id: ProviderId::new("openrouter"),
@@ -141,17 +141,98 @@ pub fn source_catalog() -> Vec<SourceDescriptor> {
     ]
 }
 
-/// Build every connect-screen row: probe presence for each known source and pair it with the
-/// stored consent. Presence is checked for *all* sources (the user needs to see what's
-/// available); reading a secret still requires [`SourceState::active`].
+/// One OAuth login discovered for a multi-account provider (Codex, Claude Code) — in Oh My Pi's
+/// per-profile credential store or the vendor CLI's own store — already deduplicated by account.
+/// Each becomes its own per-account [`SourceDescriptor`] so multiple logins are connected and
+/// shown independently. Pure data: the adapter does the IO and constructs these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredAccount {
+    /// The base provider this login belongs to: `"codex"` or `"claude-code"`. Drives the
+    /// per-account source id, display name, disclosure, and refreshed-token namespace.
+    pub base: ProviderId,
+    /// Provider account id — stable across profiles and token refreshes; the dedup key and the
+    /// source-id suffix.
+    pub account_id: String,
+    /// Account email for the panel subtitle, when known.
+    pub email: Option<String>,
+    /// Where this login was found, e.g. `"Oh My Pi · work"` or `"Codex CLI"`.
+    pub origin: String,
+}
+
+/// Display metadata for a base provider that supports per-account discovery.
+struct AccountProviderSpec {
+    base: &'static str,
+    display_name: &'static str,
+    access_note: &'static str,
+}
+
+/// Honest, per-base disclosures shown before opt-in. Identical across a provider's accounts; the
+/// email (and origin) tell them apart in the UI.
+const CODEX_ACCESS_NOTE: &str = "Reuses a Codex login already on this machine — the OAuth token \
+     kept by the Codex CLI (~/.codex/auth.json) or by Oh My Pi (per profile) — to read that \
+     ChatGPT subscription's Codex usage. The token is never shown, never stored in MLT's \
+     database or logs, and is sent only to OpenAI.";
+const CLAUDE_CODE_ACCESS_NOTE: &str = "Reuses a Claude Code login already on this machine — the \
+     OAuth token kept by Claude Code or by Oh My Pi (per profile) — to read that Claude \
+     subscription's usage. The token is never shown, never stored in MLT's database or logs, \
+     and is sent only to Anthropic.";
+
+/// The providers that expand into per-account sources from local OAuth stores. Registering a new
+/// multi-account provider is one entry here (plus its strategy + store wiring in the adapter).
+const ACCOUNT_PROVIDERS: &[AccountProviderSpec] = &[
+    AccountProviderSpec {
+        base: "codex",
+        display_name: "Codex",
+        access_note: CODEX_ACCESS_NOTE,
+    },
+    AccountProviderSpec {
+        base: "claude-code",
+        display_name: "Claude Code",
+        access_note: CLAUDE_CODE_ACCESS_NOTE,
+    },
+];
+
+/// The source id for a per-account login: `<base>:<account_id>`. Stable per account, so a login
+/// keeps the same id — and thus the same consent and cached-token namespace — across refreshes
+/// and across the profiles/stores it appears in.
+pub fn account_source_id(base: &str, account_id: &str) -> String {
+    format!("{base}:{account_id}")
+}
+
+/// The keychain key (under MLT's own service) for OUR refreshed copy of one account's token,
+/// namespaced by base + account id so two logins never collide — never the vendor's own store,
+/// which MLT only reads (AGENTS.md). The catalog and the fetch strategy both derive the key from
+/// here, so disconnect purges exactly what the strategy wrote.
+pub fn account_cache_key(base: &str, account_id: &str) -> String {
+    format!("oauth.{base}.{account_id}")
+}
+
+/// Build the connect-screen descriptor for one discovered account, or `None` if its base isn't a
+/// known multi-account provider. The account id makes the source id and cache key unique, so two
+/// logins never collide in consent, identity, or keychain storage.
+pub fn account_descriptor(base: &str, account_id: &str) -> Option<SourceDescriptor> {
+    let spec = ACCOUNT_PROVIDERS.iter().find(|s| s.base == base)?;
+    Some(SourceDescriptor {
+        id: ProviderId::new(account_source_id(spec.base, account_id)),
+        display_name: spec.display_name,
+        access_note: spec.access_note,
+        credential: CredentialKind::LocalLogin,
+        oauth_cache_key: Some(account_cache_key(spec.base, account_id)),
+    })
+}
+
+/// Build every connect-screen row: probe presence for each static source and pair it with the
+/// stored consent, then expand the discovered per-account logins. Reading a secret still requires
+/// [`SourceState::active`].
 pub async fn discover_sources(
     catalog: &[SourceDescriptor],
+    accounts: &[DiscoveredAccount],
     probe: &dyn SourceProbe,
     consent: &dyn ConsentStore,
     labels: &dyn SourceLabels,
     identity: &dyn IdentityStore,
 ) -> Result<Vec<SourceState>, PortError> {
-    let mut states = Vec::with_capacity(catalog.len());
+    let mut states = Vec::with_capacity(catalog.len() + accounts.len());
     for descriptor in catalog {
         let enabled = consent.is_enabled(&descriptor.id)?;
         let present = probe.is_present(&descriptor.id).await;
@@ -160,14 +241,34 @@ pub async fn discover_sources(
         state.account = identity.identity(&descriptor.id)?;
         states.push(state);
     }
+    // Discovered accounts are present by construction (discovery already found the credential),
+    // so they skip the file probe. The email surfaced by discovery seeds the account subtitle
+    // immediately, before any usage fetch resolves identity.
+    for account in accounts {
+        let Some(descriptor) = account_descriptor(account.base.as_str(), &account.account_id)
+        else {
+            continue;
+        };
+        let enabled = consent.is_enabled(&descriptor.id)?;
+        let mut state = descriptor.to_state(true, enabled);
+        state.label = labels.label(&descriptor.id)?;
+        state.account = identity.identity(&descriptor.id)?.or_else(|| {
+            account.email.clone().map(|email| AccountIdentity {
+                email: Some(email),
+                organization: None,
+            })
+        });
+        states.push(state);
+    }
     Ok(states)
 }
 
-/// The sources the refresh loop may actually fetch: opted-in **and** present. Consent is
-/// checked first so a disabled source is never even probed — the presence check stays off
-/// the hot path until the user has consented.
+/// The sources the refresh loop may actually fetch: opted-in **and** present. Consent is checked
+/// first so a disabled source is never even probed — the presence check stays off the hot path
+/// until the user has consented.
 pub async fn active_sources(
     catalog: &[SourceDescriptor],
+    accounts: &[DiscoveredAccount],
     probe: &dyn SourceProbe,
     consent: &dyn ConsentStore,
 ) -> Result<Vec<ProviderId>, PortError> {
@@ -183,6 +284,16 @@ pub async fn active_sources(
         };
         if active_now {
             active.push(descriptor.id.clone());
+        }
+    }
+    // A discovered account is present by construction, so consent alone gates it.
+    for account in accounts {
+        let id = ProviderId::new(account_source_id(
+            account.base.as_str(),
+            &account.account_id,
+        ));
+        if consent.is_enabled(&id)? {
+            active.push(id);
         }
     }
     Ok(active)
@@ -316,6 +427,144 @@ mod tests {
         assert!(claude.access_note.to_lowercase().contains("anthropic"));
     }
 
+    #[test]
+    fn account_descriptor_is_a_reused_login_namespaced_per_provider_and_account() {
+        let codex = account_descriptor("codex", "acct-123").expect("codex base is registered");
+        assert_eq!(codex.id.as_str(), "codex:acct-123");
+        assert_eq!(codex.credential, CredentialKind::LocalLogin);
+        assert_eq!(codex.display_name, "Codex");
+        assert!(
+            codex.access_note.to_lowercase().contains("openai"),
+            "discloses where data goes"
+        );
+        assert_eq!(
+            codex.cached_secret_keys(),
+            vec!["oauth.codex.acct-123".to_string()]
+        );
+
+        // The same machinery serves Claude — a distinct base / display / cache namespace.
+        let claude =
+            account_descriptor("claude-code", "acct-123").expect("claude-code is registered");
+        assert_eq!(claude.id.as_str(), "claude-code:acct-123");
+        assert_eq!(claude.display_name, "Claude Code");
+        assert!(
+            claude.access_note.to_lowercase().contains("anthropic"),
+            "discloses where data goes"
+        );
+        assert_eq!(
+            claude.cached_secret_keys(),
+            vec!["oauth.claude-code.acct-123".to_string()]
+        );
+
+        // A different account → a different id; an unregistered base → no descriptor.
+        assert_ne!(
+            account_descriptor("codex", "acct-999").unwrap().id,
+            codex.id
+        );
+        assert!(account_descriptor("mystery", "x").is_none());
+    }
+
+    #[tokio::test]
+    async fn discovers_accounts_across_providers_as_present_per_account_sources() {
+        let accounts = [
+            DiscoveredAccount {
+                base: ProviderId::new("codex"),
+                account_id: "acct-a".into(),
+                email: Some("a@example.com".into()),
+                origin: "Oh My Pi · work".into(),
+            },
+            DiscoveredAccount {
+                base: ProviderId::new("claude-code"),
+                account_id: "acct-b".into(),
+                email: None,
+                origin: "Oh My Pi · default".into(),
+            },
+        ];
+        let probe = FakeProbe::default(); // nothing present on disk
+        let consent = FakeConsent {
+            enabled: ["codex:acct-a"].into_iter().map(String::from).collect(),
+        };
+        let labels = FakeLabels {
+            labels: std::collections::HashMap::new(),
+        };
+        let identity = FakeIdentity::default();
+
+        let states = discover_sources(&[], &accounts, &probe, &consent, &labels, &identity)
+            .await
+            .unwrap();
+        assert_eq!(states.len(), 2);
+        // A Codex and a Claude account, each present-by-discovery (never file-probed), enabled
+        // only where consented, email seeded from discovery — one shared code path, both providers.
+        let a = states
+            .iter()
+            .find(|s| s.id.as_str() == "codex:acct-a")
+            .unwrap();
+        assert!(a.present && a.enabled && a.active());
+        assert_eq!(
+            a.account.as_ref().and_then(|x| x.email.as_deref()),
+            Some("a@example.com")
+        );
+        let b = states
+            .iter()
+            .find(|s| s.id.as_str() == "claude-code:acct-b")
+            .unwrap();
+        assert!(
+            b.present && !b.enabled && !b.active(),
+            "unconsented account stays inactive"
+        );
+
+        let active = active_sources(&[], &accounts, &probe, &consent)
+            .await
+            .unwrap();
+        assert_eq!(active, vec![ProviderId::new("codex:acct-a")]);
+        assert_eq!(
+            probe.probes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "discovered accounts are present by discovery and never file-probed"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovered_account_prefers_stored_identity_over_discovery_email() {
+        let accounts = [DiscoveredAccount {
+            base: ProviderId::new("codex"),
+            account_id: "acct-a".into(),
+            email: Some("discovered@example.com".into()),
+            origin: "Oh My Pi · work".into(),
+        }];
+        let identity = FakeIdentity {
+            identities: [(
+                "codex:acct-a".to_string(),
+                AccountIdentity {
+                    email: Some("stored@example.com".into()),
+                    organization: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let states = discover_sources(
+            &[],
+            &accounts,
+            &FakeProbe::default(),
+            &FakeConsent {
+                enabled: HashSet::new(),
+            },
+            &FakeLabels {
+                labels: std::collections::HashMap::new(),
+            },
+            &identity,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            states[0].account.as_ref().and_then(|x| x.email.as_deref()),
+            Some("stored@example.com")
+        );
+    }
+
     #[tokio::test]
     async fn discover_pairs_presence_with_consent_for_every_source() {
         let catalog = [descriptor("a"), descriptor("b")];
@@ -343,7 +592,7 @@ mod tests {
             .into_iter()
             .collect(),
         };
-        let states = discover_sources(&catalog, &probe, &consent, &labels, &identity)
+        let states = discover_sources(&catalog, &[], &probe, &consent, &labels, &identity)
             .await
             .unwrap();
 
@@ -375,7 +624,9 @@ mod tests {
             enabled: ["on"].into_iter().map(String::from).collect(),
         };
 
-        let active = active_sources(&catalog, &probe, &consent).await.unwrap();
+        let active = active_sources(&catalog, &[], &probe, &consent)
+            .await
+            .unwrap();
         assert_eq!(active, vec![ProviderId::new("on")]);
         // The disabled source is gated on consent *before* any presence probe runs: exactly
         // one probe fired (for the enabled source), so "off" was never inspected at all.
@@ -421,7 +672,9 @@ mod tests {
             enabled: ["router", "cli"].into_iter().map(String::from).collect(),
         };
 
-        let active = active_sources(&catalog, &probe, &consent).await.unwrap();
+        let active = active_sources(&catalog, &[], &probe, &consent)
+            .await
+            .unwrap();
         // "router" (api-key, consented) is active despite being absent from the probe; "cli"
         // (local-login, consented but not present) is not.
         assert_eq!(active, vec![ProviderId::new("router")]);
@@ -459,7 +712,7 @@ mod tests {
         // Local-login source that caches a refreshed OAuth copy: exactly that entry, and never
         // an api_key.* key (it has no user-entered key).
         let oauth_source = SourceDescriptor {
-            oauth_cache_key: Some("oauth.example"),
+            oauth_cache_key: Some("oauth.example".to_string()),
             ..descriptor("example")
         };
         assert_eq!(
