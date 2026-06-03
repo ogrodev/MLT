@@ -11,17 +11,32 @@ import {
   setSourceEnabled,
   setSourceLabel,
   type SourceState,
-  type Status,
   type UsageSnapshot,
   type UsageWindow,
 } from '$lib/usage';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import {
+  clearUsage,
+  connectionState,
+  errorFor,
+  recordUsage,
+  recordUsageError,
+  reportsUsage,
+  resetCountdown,
+  selectedAccount,
+  snapshotFor,
+  sourceActive,
+  usageWindowKey,
+  type Tone,
+  type UsageRecords,
+} from '$lib/usageState';
 
 // Usage snapshot and last error keyed by provider id. Per-provider so each tile shows only its
 // own data: a failure (or stale data) for one provider never blanks or overwrites another's
 // (provider data stays siloed — an MLT invariant).
 let snapshots = $state<Record<string, UsageSnapshot>>({});
 let errors = $state<Record<string, string>>({});
+const usageRecords: UsageRecords = { snapshots, errors };
 let now = $state(Date.now());
 let sources = $state<SourceState[]>([]);
 let view = $state<'usage' | 'sources'>('usage');
@@ -48,8 +63,6 @@ const KIND_LABEL: Record<UsageWindow['kind'], string> = {
   Custom: 'Usage',
 };
 
-type Tone = 'ok' | 'warn' | 'err' | 'idle';
-
 // Connected-state indicator. Always shows *something*: not-connected before any opt-in,
 // connecting before the first fetch, the provider's freshness once we have data.
 const TONE: Record<Tone, string> = {
@@ -58,25 +71,6 @@ const TONE: Record<Tone, string> = {
   err: 'text-red-600 dark:text-red-400',
   idle: 'text-neutral-500 dark:text-neutral-400',
 };
-const STATUS_CONN: Record<Status, { label: string; tone: Tone }> = {
-  Ok: { label: 'Connected', tone: 'ok' },
-  Stale: { label: 'Stale', tone: 'warn' },
-  Error: { label: 'Error', tone: 'err' },
-};
-
-// A source is "connected" only when discovered *and* opted in (the consent gate).
-// A local-login source is connected when discovered *and* opted in; an API-key source is
-// connected when a (validated) key is stored — i.e. simply enabled, nothing to detect.
-function sourceActive(s: SourceState): boolean {
-  return s.credential === 'ApiKey' ? s.enabled : s.present && s.enabled;
-}
-
-// Providers with a usage fetch wired in the backend (mirrors src-tauri's `fetch_for`): the Claude
-// Code CLI login plus every per-account source (`codex:<id>`, `claude-code:<id>`). A connected
-// provider not covered here (e.g. OpenRouter) shows an honest "usage coming" placeholder, not
-// fabricated bars (ADR 0015).
-const reportsUsage = (id: string): boolean =>
-  id === 'claude-code' || id.startsWith('codex:') || id.startsWith('claude-code:');
 
 // Tab/title label: a user's custom name wins; multiple per-account logins (Codex, Claude Code)
 // share a provider display name, so their account email disambiguates them; other sources show
@@ -98,28 +92,15 @@ const selected = $derived.by(() => {
 
 // The selected provider's own usage + error. Reading them by `selected.id` is what keeps the
 // panel siloed: it can only ever show the chosen provider's data, never another's.
-const selSnap = $derived(selected ? (snapshots[selected.id] ?? null) : null);
-const selErr = $derived(selected ? (errors[selected.id] ?? null) : null);
+const selSnap = $derived(selected ? snapshotFor(usageRecords, selected.id) : null);
+const selErr = $derived(selected ? errorFor(usageRecords, selected.id) : null);
 
 // The account identifier (email, else org) for the *selected* provider, shown as a subtitle.
 // Prefer the live snapshot's identity, but only for the same provider — never render one
 // provider's identity under another — then fall back to the cached identity on the row.
-const selectedEmail = $derived.by((): string | null => {
-  if (!selected) return null;
-  if (selSnap?.account) {
-    return selSnap.account.email ?? selSnap.account.organization;
-  }
-  return selected.account?.email ?? selected.account?.organization ?? null;
-});
+const selectedEmail = $derived(selectedAccount(selSnap, selected));
 
-const conn = $derived.by((): { label: string; tone: Tone } => {
-  if (!selected) return { label: 'Not connected', tone: 'idle' };
-  // A connected provider with no usage endpoint yet is simply "Connected".
-  if (!reportsUsage(selected.id)) return { label: 'Connected', tone: 'ok' };
-  if (selSnap) return STATUS_CONN[selSnap.status];
-  if (selErr) return { label: 'Disconnected', tone: 'err' };
-  return { label: 'Connecting…', tone: 'idle' };
-});
+const conn = $derived(connectionState(selected, selSnap, selErr));
 
 function label(w: UsageWindow): string {
   return w.reset_description ?? KIND_LABEL[w.kind];
@@ -131,21 +112,25 @@ function barColor(pct: number): string {
   return 'bg-emerald-500';
 }
 
-function countdown(resetsAt: number | null): string {
-  if (resetsAt == null) return '';
-  const ms = resetsAt - now;
-  if (ms <= 0) return 'resetting…';
-  const mins = Math.floor(ms / 60000);
-  const d = Math.floor(mins / 1440);
-  const h = Math.floor((mins % 1440) / 60);
-  const m = mins % 60;
-  if (d > 0) return `resets in ${d}d ${h}h`;
-  if (h > 0) return `resets in ${h}h ${m}m`;
-  return `resets in ${m}m`;
-}
 
 function lastUpdated(ms: number): string {
   return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+async function fetchConnectedUsage(discovered: SourceState[]): Promise<void> {
+  await Promise.all(
+    discovered
+      .filter((s) => sourceActive(s) && reportsUsage(s.id))
+      .map((s) =>
+        fetchUsage(s.id)
+          .then((snap) => {
+            recordUsage(usageRecords, snap);
+          })
+          .catch((e) => {
+            recordUsageError(usageRecords, { provider: s.id, message: String(e) });
+          }),
+      ),
+  );
 }
 
 // Opt a source in/out. The backend persists the choice and, on opt-in, kicks an immediate
@@ -156,12 +141,11 @@ async function toggleSource(source: SourceState, enabled: boolean): Promise<void
     if (!enabled) {
       // Disconnected → drop its usage/error so a later reconnect starts clean and nothing
       // lingers. Other providers' entries are untouched.
-      delete snapshots[source.id];
-      delete errors[source.id];
+      clearUsage(usageRecords, source.id);
     }
     // On enable the backend kicks a refresh; a usage-updated/usage-error event fills the tile.
   } catch (e) {
-    errors[source.id] = String(e);
+    recordUsageError(usageRecords, { provider: source.id, message: String(e) });
   }
 }
 
@@ -229,33 +213,19 @@ onMount(() => {
   const unlisteners: Array<() => void> = [];
 
   listSources()
-    .then((discovered) => {
+    .then(async (discovered) => {
       sources = discovered;
       // Fetch each connected, usage-reporting provider once on open — siloed per provider, and
       // never reading a credential for a source the user hasn't connected.
-      return Promise.all(
-        discovered
-          .filter((s) => sourceActive(s) && reportsUsage(s.id))
-          .map((s) =>
-            fetchUsage(s.id)
-              .then((snap) => {
-                snapshots[snap.provider] = snap;
-                delete errors[snap.provider];
-              })
-              .catch((e) => {
-                errors[s.id] = String(e);
-              }),
-          ),
-      );
+      await fetchConnectedUsage(discovered);
     })
     .catch(() => {});
 
   onUsageUpdated((s) => {
-    snapshots[s.provider] = s;
-    delete errors[s.provider];
+    recordUsage(usageRecords, s);
   }).then((u) => unlisteners.push(u));
   onUsageError((e) => {
-    errors[e.provider] = e.message;
+    recordUsageError(usageRecords, e);
   }).then((u) => unlisteners.push(u));
 
   // Re-discover whenever the popover regains focus (i.e. each time it's opened), so presence
@@ -265,8 +235,9 @@ onMount(() => {
     .onFocusChanged(({ payload: focused }) => {
       if (focused) {
         listSources()
-          .then((s) => {
+          .then(async (s) => {
             sources = s;
+            await fetchConnectedUsage(s);
           })
           .catch(() => {});
       }
@@ -609,7 +580,7 @@ onMount(() => {
         </div>
       {:else if selSnap}
         <ul class="space-y-4">
-          {#each selSnap.windows as w (w.kind + (w.reset_description ?? ''))}
+          {#each selSnap.windows as w, i (usageWindowKey(w, i))}
             <li>
               <div class="mb-1 flex items-baseline justify-between">
                 <span class="text-[13px] font-medium text-neutral-800 dark:text-neutral-200"
@@ -625,9 +596,9 @@ onMount(() => {
                   style="width: {Math.min(100, Math.max(0, w.used_percent))}%"
                 ></div>
               </div>
-              {#if countdown(w.resets_at)}
+              {#if resetCountdown(w.resets_at, now)}
                 <p class="mt-1 text-[11px] text-neutral-500 dark:text-neutral-400">
-                  {countdown(w.resets_at)}
+                  {resetCountdown(w.resets_at, now)}
                 </p>
               {/if}
             </li>

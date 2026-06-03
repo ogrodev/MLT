@@ -44,10 +44,10 @@ Recommended build order: **OpenRouter → Codex → Claude Code → OpenAI API �
 ### Codex (ChatGPT/OpenAI subscription) — *cleanest of all*
 - **Credential:** read `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`). Shape:
   `{ "tokens": { "id_token","access_token","refresh_token","account_id" }, "last_refresh" }`.
-  Plain JSON, **no Keychain**. Refresh when `last_refresh` > 8 days via
+  Plain JSON, **no Keychain**. Refresh stale access tokens via
   `POST auth.openai.com/oauth/token` (`client_id: app_EMoamEEZ73f0CkXaXp7hrann`,
-  `grant_type: refresh_token`). Write the refreshed token back to `auth.json` so we don't
-  fight the CLI.
+  `grant_type: refresh_token`). MLT stores refreshed copies only under its own keychain
+  service, never back into `auth.json`, so it stays read-only against the vendor store.
 - **Usage:** `GET chatgpt.com/backend-api/wham/usage` (base from `~/.codex/config.toml`
   `chatgpt_base_url`). Headers: `Authorization: Bearer`, `ChatGPT-Account-Id`, a `User-Agent`.
   Map: `rate_limit.primary_window` → session (5h), `secondary_window` → weekly; each has

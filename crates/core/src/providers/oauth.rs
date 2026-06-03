@@ -31,8 +31,8 @@ pub struct OAuthRefresher {
     /// Keychain entry (under MLT's own service) where OUR refreshed copy is cached. Distinct
     /// per provider so two providers' caches never collide; never the vendor's own store.
     cache_key: String,
-    /// Extra `scope` to send in the refresh body when the provider requires it (Codex sends
-    /// `openid profile email`; Claude sends none).
+    /// Extra `scope` to send in the refresh body when a future provider requires it. Codex and
+    /// Claude match their official clients by omitting it.
     scope: Option<String>,
 }
 
@@ -58,7 +58,7 @@ impl OAuthRefresher {
         }
     }
 
-    /// Send `scope` in the refresh body (required by Codex's OAuth token endpoint).
+    /// Send `scope` in the refresh body for providers whose token endpoint requires it.
     pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
         self.scope = Some(scope.into());
         self
@@ -133,7 +133,9 @@ fn parse_refresh_response(
     let expires_at = v
         .get("expires_in")
         .and_then(|x| x.as_i64())
-        .map(|secs| Timestamp(now.0 + secs * 1000));
+        .and_then(|secs| secs.checked_mul(1000))
+        .and_then(|ms| now.0.checked_add(ms))
+        .map(Timestamp);
     let scopes = v
         .get("scope")
         .and_then(|x| x.as_str())
@@ -330,6 +332,20 @@ mod tests {
             cache.get(TEST_CACHE_KEY).unwrap().is_some(),
             "refreshed token must be cached"
         );
+    }
+
+    #[tokio::test]
+    async fn overflowing_expires_in_is_dropped_not_panicked() {
+        let cache = Arc::new(MemSecrets::default());
+        let body = format!(
+            r#"{{"access_token":"new-access","expires_in":{}}}"#,
+            i64::MAX
+        );
+        let http = Arc::new(FakeHttp::new(200, &body));
+        let r = refresher(Some(tokens_expiring_at(500)), cache, http, 1_000);
+        let t = r.load().await.unwrap();
+        assert_eq!(t.access_token, "new-access");
+        assert_eq!(t.expires_at, None);
     }
 
     #[tokio::test]

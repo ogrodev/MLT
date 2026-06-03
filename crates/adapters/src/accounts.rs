@@ -122,10 +122,38 @@ fn omp_accounts(omp_provider: &str, base: &'static str) -> Vec<RawAccount> {
     out
 }
 
-/// Open an external SQLite DB **read-only** — MLT never writes Oh My Pi's store. Read-only is
-/// sufficient to read a live WAL database while Oh My Pi has it open.
+/// Open an external SQLite DB **read-only** — MLT never writes Oh My Pi's store. The normal
+/// read-only open handles a live DB while Oh My Pi has it open; the immutable URI fallback covers
+/// a leftover WAL where SQLite would otherwise try to initialize `-shm` and fail read-only.
 fn open_ro(db: &Path) -> rusqlite::Result<Connection> {
-    Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY).or_else(|_| {
+        let uri = sqlite_immutable_uri(db);
+        Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+    })
+}
+
+fn sqlite_immutable_uri(db: &Path) -> String {
+    let path = db.to_string_lossy();
+    let mut uri = String::with_capacity("file:?mode=ro&immutable=1".len() + path.len());
+    uri.push_str("file:");
+    for b in path.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b':' | b'.' | b'-' | b'_' | b'~' => {
+                uri.push(char::from(b))
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                uri.push('%');
+                uri.push(char::from(HEX[(b >> 4) as usize]));
+                uri.push(char::from(HEX[(b & 0x0F) as usize]));
+            }
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    uri
 }
 
 fn read_omp_db(
@@ -224,6 +252,84 @@ impl OAuthCredentialSource for AccountCredentials {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvFixture {
+        _guard: MutexGuard<'static, ()>,
+        home: PathBuf,
+        old_omp: Option<OsString>,
+        old_codex: Option<OsString>,
+    }
+
+    impl EnvFixture {
+        fn new(name: &str) -> Self {
+            let guard = ENV_LOCK.lock().expect("env lock");
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos();
+            let home = std::env::temp_dir().join(format!(
+                "mlt-accounts-{name}-{}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&home).expect("temp home");
+            let codex_home = home.join("codex-home");
+            fs::create_dir_all(&codex_home).expect("temp codex home");
+            let old_omp = std::env::var_os("OMP_HOME");
+            let old_codex = std::env::var_os("CODEX_HOME");
+            std::env::set_var("OMP_HOME", &home);
+            std::env::set_var("CODEX_HOME", codex_home);
+            Self {
+                _guard: guard,
+                home,
+                old_omp,
+                old_codex,
+            }
+        }
+    }
+
+    impl Drop for EnvFixture {
+        fn drop(&mut self) {
+            match &self.old_omp {
+                Some(value) => std::env::set_var("OMP_HOME", value),
+                None => std::env::remove_var("OMP_HOME"),
+            }
+            match &self.old_codex {
+                Some(value) => std::env::set_var("CODEX_HOME", value),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+            let _ = fs::remove_dir_all(&self.home);
+        }
+    }
+
+    fn create_omp_db(path: &Path, rows: &[(&str, &str, &str)]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("db parent");
+        }
+        let conn = Connection::open(path).expect("fixture db");
+        conn.execute(
+            "CREATE TABLE auth_credentials (
+                provider TEXT NOT NULL,
+                credential_type TEXT NOT NULL,
+                data TEXT NOT NULL
+            )",
+            [],
+        )
+        .expect("schema");
+        for (provider, kind, data) in rows {
+            conn.execute(
+                "INSERT INTO auth_credentials (provider, credential_type, data) VALUES (?1, ?2, ?3)",
+                (provider, kind, data),
+            )
+            .expect("insert credential");
+        }
+    }
 
     fn oauth(access: &str, exp_ms: i64) -> OAuthTokens {
         OAuthTokens {
@@ -275,5 +381,60 @@ mod tests {
         let a1 = deduped.iter().find(|r| r.account_id == "acct-1").unwrap();
         assert_eq!(a1.tokens.access_token, "new");
         assert!(deduped.iter().any(|r| r.account_id == "acct-2"));
+    }
+
+    #[test]
+    fn discovered_accounts_reads_omp_profile_dbs_and_keeps_freshest_token() {
+        let fixture = EnvFixture::new("discovery");
+        let old = r#"{"access":"old-access","refresh":"old-refresh","accountId":"acct-1","email":"old@example.com","expires":100}"#;
+        let fresh = r#"{"access":"fresh-access","refresh":"fresh-refresh","accountId":"acct-1","email":"fresh@example.com","expires":500}"#;
+        let ignored_kind =
+            r#"{"access":"ignored","refresh":"r","accountId":"ignored","expires":900}"#;
+        let missing_account = r#"{"access":"missing-account","refresh":"r","expires":900}"#;
+        create_omp_db(
+            &fixture.home.join("agent").join("agent.db"),
+            &[
+                ("openai-codex", "oauth", old),
+                ("openai-codex", "api_key", ignored_kind),
+                ("openai-codex", "oauth", missing_account),
+                (
+                    "anthropic",
+                    "oauth",
+                    r#"{"access":"claude","accountId":"claude-acct","expires":1}"#,
+                ),
+            ],
+        );
+        create_omp_db(
+            &fixture
+                .home
+                .join("profiles")
+                .join("work")
+                .join("agent")
+                .join("agent.db"),
+            &[("openai-codex", "oauth", fresh)],
+        );
+
+        let accounts = discovered_accounts();
+        let codex: Vec<_> = accounts
+            .iter()
+            .filter(|account| account.base.as_str() == "codex")
+            .collect();
+
+        assert_eq!(codex.len(), 1);
+        assert_eq!(codex[0].account_id, "acct-1");
+        assert_eq!(codex[0].email.as_deref(), Some("fresh@example.com"));
+        assert_eq!(codex[0].origin, "Oh My Pi · work");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let tokens = runtime
+            .block_on(AccountCredentials::new("codex", "acct-1").load())
+            .expect("fresh account credentials");
+        assert_eq!(tokens.access_token, "fresh-access");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("fresh-refresh"));
+
+        let missing = runtime.block_on(AccountCredentials::new("codex", "missing").load());
+        assert!(matches!(missing, Err(PortError::NotFound)));
     }
 }

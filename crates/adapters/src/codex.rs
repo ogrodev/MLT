@@ -7,8 +7,7 @@ use std::sync::Arc;
 use mlt_core::domain::OAuthTokens;
 use mlt_core::ports::{Clock, HttpPort, IdentityStore, OAuthCredentialSource, SecretStore};
 use mlt_core::providers::codex::{
-    parse_identity, token_expiry, CodexStrategy, CLIENT_ID, DEFAULT_USAGE_URL, REFRESH_SCOPE,
-    TOKEN_URL,
+    parse_identity, token_expiry, CodexStrategy, CLIENT_ID, DEFAULT_USAGE_URL, TOKEN_URL,
 };
 use mlt_core::providers::oauth::OAuthRefresher;
 use mlt_core::sources::account_cache_key;
@@ -136,18 +135,15 @@ pub fn codex_strategy(account_id: &str, identity: Arc<dyn IdentityStore>) -> Cod
     let bootstrap: Arc<dyn OAuthCredentialSource> =
         Arc::new(AccountCredentials::new(BASE, account_id));
     let cache: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore::new(KEYCHAIN_SERVICE));
-    let creds: Arc<dyn OAuthCredentialSource> = Arc::new(
-        OAuthRefresher::new(
-            bootstrap,
-            cache,
-            http.clone(),
-            clock.clone(),
-            TOKEN_URL,
-            CLIENT_ID,
-            account_cache_key(BASE, account_id),
-        )
-        .with_scope(REFRESH_SCOPE),
-    );
+    let creds: Arc<dyn OAuthCredentialSource> = Arc::new(OAuthRefresher::new(
+        bootstrap,
+        cache,
+        http.clone(),
+        clock.clone(),
+        TOKEN_URL,
+        CLIENT_ID,
+        account_cache_key(BASE, account_id),
+    ));
     CodexStrategy {
         creds,
         http,

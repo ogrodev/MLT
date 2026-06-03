@@ -11,9 +11,9 @@ CLIPPY  := "$(RUSTBIN)cargo-clippy"
 LLVM_PROFDATA := $(shell xcrun --find llvm-profdata 2>/dev/null)
 LLVM_COV      := $(shell xcrun --find llvm-cov 2>/dev/null)
 
-.PHONY: check fmt fmt-check lint test deny machete purity ui-lint ui-check coverage hooks deps qa qa-release tasks
+.PHONY: check fmt fmt-check lint test deny machete purity ui-lint ui-check ui-test coverage hooks deps qa qa-release tasks
 
-check: fmt-check lint purity test deny ui-lint ui-check ## all gates (matches CI)
+check: fmt-check lint purity test deny ui-lint ui-check ui-test ## all gates (matches CI)
 
 fmt: ; $(FMT) --all
 fmt-check: ; $(FMT) --all --check
@@ -27,6 +27,7 @@ purity: ; ./scripts/check-core-purity.sh
 tasks: ; ./scripts/check-tasks.sh $(ARGS)
 ui-lint: ; pnpm exec biome ci .
 ui-check: ; pnpm run check
+ui-test: ; pnpm test
 coverage: ; LLVM_PROFDATA="$(LLVM_PROFDATA)" LLVM_COV="$(LLVM_COV)" cargo llvm-cov --package mlt-core --fail-under-lines 80
 hooks: ; lefthook install
 # Install/refresh dependencies THROUGH Socket Firewall (blocks malware at fetch, any depth).

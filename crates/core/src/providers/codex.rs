@@ -21,8 +21,6 @@ pub const DEFAULT_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage"
 /// user's real Codex refresh token.
 pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-/// Scope the OpenAI token endpoint requires in the refresh body.
-pub const REFRESH_SCOPE: &str = "openid profile email";
 
 /// The session (5h) and weekly (7d) windows, in minutes. We classify each window by its
 /// reported length rather than trusting its position, so a server that swaps primary/secondary
@@ -36,6 +34,10 @@ struct RawWindow {
     used_percent: f64,
     window_minutes: Option<i64>,
     resets_at: Option<Timestamp>,
+}
+
+fn unix_secs_to_timestamp(secs: i64) -> Option<Timestamp> {
+    secs.checked_mul(1000).map(Timestamp)
 }
 
 /// Extract a `{ used_percent, reset_at, limit_window_seconds }` window. Lossy: a `null` /
@@ -53,7 +55,7 @@ fn raw_window(val: Option<&serde_json::Value>) -> Option<RawWindow> {
     let resets_at = obj
         .get("reset_at")
         .and_then(serde_json::Value::as_i64)
-        .map(|secs| Timestamp(secs * 1000));
+        .and_then(unix_secs_to_timestamp);
     Some(RawWindow {
         used_percent,
         window_minutes,
@@ -203,7 +205,7 @@ pub fn parse_identity(access_token: &str) -> AccountIdentity {
 /// expiry-vs-clock logic it uses for Claude, instead of a bespoke staleness rule.
 pub fn token_expiry(access_token: &str) -> Option<Timestamp> {
     let exp = jwt_claims(access_token)?.get("exp")?.as_i64()?;
-    Some(Timestamp(exp * 1000))
+    unix_secs_to_timestamp(exp)
 }
 
 /// The OAuth strategy for Codex: read the CLI's token, poll `wham/usage`.
@@ -381,6 +383,17 @@ mod tests {
     }
 
     #[test]
+    fn overflowing_reset_timestamp_is_dropped_not_panicked() {
+        let body = format!(
+            r#"{{"rate_limit":{{"primary_window":{{"used_percent":1,"reset_at":{},"limit_window_seconds":18000}}}}}}"#,
+            i64::MAX
+        );
+        let w = parse_usage(&body).expect("overflowing timestamp is lossy");
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].resets_at, None);
+    }
+
+    #[test]
     fn identity_reads_email_from_jwt_claims_lossily() {
         assert_eq!(
             parse_identity(JWT_PROFILE_EMAIL).email.as_deref(),
@@ -415,9 +428,12 @@ mod tests {
             token_expiry(JWT_WITH_EXP),
             Some(Timestamp(1_893_456_000_000))
         );
-        // No `exp` claim, or an unparseable token → None (the refresher then trusts the token
-        // and lets any real 401 surface, rather than refreshing blindly).
+        // No `exp` claim, an overflowing `exp`, or an unparseable token → None (the refresher
+        // then trusts the token and lets any real 401 surface, rather than refreshing blindly).
+        const JWT_EXP_OVERFLOW: &str =
+            "eyJhbGciOiJSUzI1NiJ9.eyJleHAiOjkyMjMzNzIwMzY4NTQ3NzU4MDd9.sig";
         assert_eq!(token_expiry(JWT_NO_EMAIL), None);
+        assert_eq!(token_expiry(JWT_EXP_OVERFLOW), None);
         assert_eq!(token_expiry("garbage"), None);
     }
 
