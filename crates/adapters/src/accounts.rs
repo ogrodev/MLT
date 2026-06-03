@@ -255,10 +255,8 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct EnvFixture {
         _guard: MutexGuard<'static, ()>,
@@ -269,7 +267,7 @@ mod tests {
 
     impl EnvFixture {
         fn new(name: &str) -> Self {
-            let guard = ENV_LOCK.lock().expect("env lock");
+            let guard = crate::TEST_ENV_LOCK.lock().expect("env lock");
             let unique = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("time after epoch")
@@ -353,6 +351,18 @@ mod tests {
         assert_eq!(raw.expires_ms, 1_781_000_000_000);
         assert_eq!(raw.tokens.access_token, "at");
         assert_eq!(raw.tokens.account_id.as_deref(), Some("acct-1"));
+    }
+
+    #[test]
+    fn parse_omp_credential_falls_back_to_jwt_expiry() {
+        let jwt = "eyJhbGciOiJSUzI1NiJ9.eyJleHAiOjE4OTM0NTYwMDB9.sig";
+        let data = format!(
+            r#"{{"access":"{jwt}","refresh":"rt","accountId":"acct-1","email":"a@x.com"}}"#
+        );
+        let raw = parse_omp_credential(&data, "codex", "default").expect("parse");
+
+        assert_eq!(raw.expires_ms, 1_893_456_000_000);
+        assert_eq!(raw.tokens.expires_at, Some(Timestamp(1_893_456_000_000)));
     }
 
     #[test]

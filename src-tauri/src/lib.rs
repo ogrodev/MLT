@@ -36,6 +36,13 @@ enum PopoverAction {
     Ignore,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageRoute<'a> {
+    Claude,
+    Codex { account_id: &'a str },
+    ClaudeAccount { account_id: &'a str },
+}
+
 /// Popover interaction state shared between the tray-click and focus-loss handlers.
 #[derive(Default)]
 struct PopoverState {
@@ -391,22 +398,34 @@ async fn claude_account_usage(
     strategy.fetch(&ctx).await
 }
 
+fn usage_route(id: &ProviderId) -> Option<UsageRoute<'_>> {
+    let id = id.as_str();
+    if id == "claude-code" {
+        return Some(UsageRoute::Claude);
+    }
+    match id.split_once(':') {
+        Some(("codex", account_id)) if !account_id.is_empty() => {
+            Some(UsageRoute::Codex { account_id })
+        }
+        Some(("claude-code", account_id)) if !account_id.is_empty() => {
+            Some(UsageRoute::ClaudeAccount { account_id })
+        }
+        _ => None,
+    }
+}
+
 /// Fetch one source's usage, or `None` for a source with no fetch wired yet. The map of
 /// id → fetcher is the single place a connected source becomes a network call.
 async fn fetch_for(
     id: &ProviderId,
     identity: Arc<dyn IdentityStore>,
 ) -> Option<Result<UsageSnapshot, mlt_core::providers::FetchError>> {
-    let id = id.as_str();
-    // The standalone Claude Code CLI login (keychain) is a single static source.
-    if id == "claude-code" {
-        return Some(claude_usage(identity).await);
-    }
-    // Per-account sources are `<base>:<account_id>` — route to that provider's strategy.
-    match id.split_once(':') {
-        Some(("codex", account_id)) => Some(codex_usage(account_id, identity).await),
-        Some(("claude-code", account_id)) => Some(claude_account_usage(account_id, identity).await),
-        _ => None,
+    match usage_route(id)? {
+        UsageRoute::Claude => Some(claude_usage(identity).await),
+        UsageRoute::Codex { account_id } => Some(codex_usage(account_id, identity).await),
+        UsageRoute::ClaudeAccount { account_id } => {
+            Some(claude_account_usage(account_id, identity).await)
+        }
     }
 }
 
@@ -594,7 +613,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_api_key, descriptor_for, disconnect};
+    use super::{apply_api_key, descriptor_for, disconnect, usage_route, UsageRoute};
     use super::{popover_action, PopoverAction, REOPEN_DEBOUNCE};
     use async_trait::async_trait;
     use mlt_core::domain::{AccountIdentity, ProviderId};
@@ -725,6 +744,30 @@ mod tests {
         ProviderId::new("openrouter")
     }
 
+    #[test]
+    fn usage_route_matches_supported_usage_source_ids() {
+        assert_eq!(
+            usage_route(&ProviderId::new("claude-code")),
+            Some(UsageRoute::Claude)
+        );
+        assert_eq!(
+            usage_route(&ProviderId::new("codex:acct-1")),
+            Some(UsageRoute::Codex {
+                account_id: "acct-1"
+            })
+        );
+        assert_eq!(
+            usage_route(&ProviderId::new("claude-code:acct-2")),
+            Some(UsageRoute::ClaudeAccount {
+                account_id: "acct-2"
+            })
+        );
+        assert_eq!(usage_route(&ProviderId::new("openrouter")), None);
+        assert_eq!(usage_route(&ProviderId::new("codex")), None);
+        assert_eq!(usage_route(&ProviderId::new("codex:")), None);
+        assert_eq!(usage_route(&ProviderId::new("claude-code:")), None);
+        assert_eq!(usage_route(&ProviderId::new("unknown:acct")), None);
+    }
     #[tokio::test]
     async fn apply_api_key_stores_and_connects_a_valid_key() {
         let secrets = MemSecrets::default();

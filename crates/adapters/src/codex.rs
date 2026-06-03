@@ -157,6 +157,51 @@ pub fn codex_strategy(account_id: &str, identity: Arc<dyn IdentityStore>) -> Cod
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::MutexGuard;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct EnvFixture {
+        _guard: MutexGuard<'static, ()>,
+        home: PathBuf,
+        old_codex: Option<OsString>,
+    }
+
+    impl EnvFixture {
+        fn new(name: &str) -> Self {
+            let guard = crate::TEST_ENV_LOCK.lock().expect("env lock");
+            let unique = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos();
+            let home = std::env::temp_dir()
+                .join(format!("mlt-codex-{name}-{}-{unique}", std::process::id()));
+            fs::create_dir_all(&home).expect("temp codex home");
+            let old_codex = std::env::var_os("CODEX_HOME");
+            std::env::set_var("CODEX_HOME", &home);
+            Self {
+                _guard: guard,
+                home,
+                old_codex,
+            }
+        }
+
+        fn write_auth(&self, raw: &str) {
+            fs::write(self.home.join("auth.json"), raw).expect("auth fixture");
+        }
+    }
+
+    impl Drop for EnvFixture {
+        fn drop(&mut self) {
+            match &self.old_codex {
+                Some(value) => std::env::set_var("CODEX_HOME", value),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+            let _ = fs::remove_dir_all(&self.home);
+        }
+    }
 
     // A JWT (header.payload.sig) whose payload is {"exp":1893456000,"email":"exp@example.com"}.
     const JWT_WITH_EXP: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE4OTM0NTYwMDAsImVtYWlsIjoiZXhwQGV4YW1wbGUuY29tIn0.sig";
@@ -177,12 +222,53 @@ mod tests {
     }
 
     #[test]
+    fn parses_codex_cli_camel_case_oauth_shape() {
+        let raw = format!(
+            r#"{{"tokens":{{"accessToken":"{JWT_WITH_EXP}","refreshToken":"rt","accountId":"acct-xyz"}}}}"#
+        );
+        let t = parse_codex_cli(&raw).unwrap();
+        assert_eq!(t.access_token, JWT_WITH_EXP);
+        assert_eq!(t.refresh_token.as_deref(), Some("rt"));
+        assert_eq!(t.account_id.as_deref(), Some("acct-xyz"));
+    }
+
+    #[test]
     fn parses_codex_cli_api_key_shape_without_an_account() {
         let t = parse_codex_cli(r#"{"OPENAI_API_KEY":"sk-x"}"#).unwrap();
         assert_eq!(t.access_token, "sk-x");
         assert!(
             t.account_id.is_none(),
             "api-key auth has no subscription account"
+        );
+    }
+
+    #[test]
+    fn codex_cli_accounts_reads_oauth_and_skips_non_accounts() {
+        let fixture = EnvFixture::new("accounts");
+        fixture.write_auth(&format!(
+            r#"{{"tokens":{{"access_token":"{JWT_WITH_EXP}","refresh_token":"rt","account_id":"acct-cli"}}}}"#
+        ));
+
+        let accounts = codex_cli_accounts();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].base, "codex");
+        assert_eq!(accounts[0].account_id, "acct-cli");
+        assert_eq!(accounts[0].email.as_deref(), Some("exp@example.com"));
+        assert_eq!(accounts[0].origin, "Codex CLI");
+        assert_eq!(accounts[0].tokens.access_token, JWT_WITH_EXP);
+
+        fixture.write_auth(r#"{"OPENAI_API_KEY":"sk-x"}"#);
+        assert!(
+            codex_cli_accounts().is_empty(),
+            "Codex API-key auth has no subscription account"
+        );
+
+        fixture.write_auth(&format!(
+            r#"{{"tokens":{{"access_token":"{JWT_WITH_EXP}","refresh_token":"rt"}}}}"#
+        ));
+        assert!(
+            codex_cli_accounts().is_empty(),
+            "OAuth auth without account_id is not a discoverable account"
         );
     }
 

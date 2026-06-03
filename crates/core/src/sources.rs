@@ -525,6 +525,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discovered_account_prefers_stored_identity_over_discovery_email() {
+        let accounts = [DiscoveredAccount {
+            base: ProviderId::new("codex"),
+            account_id: "acct-a".into(),
+            email: Some("discovered@example.com".into()),
+            origin: "Oh My Pi · work".into(),
+        }];
+        let identity = FakeIdentity {
+            identities: [(
+                "codex:acct-a".to_string(),
+                AccountIdentity {
+                    email: Some("stored@example.com".into()),
+                    organization: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let states = discover_sources(
+            &[],
+            &accounts,
+            &FakeProbe::default(),
+            &FakeConsent {
+                enabled: HashSet::new(),
+            },
+            &FakeLabels {
+                labels: std::collections::HashMap::new(),
+            },
+            &identity,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            states[0].account.as_ref().and_then(|x| x.email.as_deref()),
+            Some("stored@example.com")
+        );
+    }
+
+    #[tokio::test]
     async fn discover_pairs_presence_with_consent_for_every_source() {
         let catalog = [descriptor("a"), descriptor("b")];
         let probe = FakeProbe {

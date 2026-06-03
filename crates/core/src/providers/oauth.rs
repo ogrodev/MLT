@@ -392,6 +392,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_http_failure_errors_without_caching() {
+        let cache = Arc::new(MemSecrets::default());
+        let http = Arc::new(FakeHttp::new(401, r#"{"error":"invalid_grant"}"#));
+        let r = refresher(
+            Some(tokens_expiring_at(500)),
+            cache.clone(),
+            http.clone(),
+            1_000,
+        );
+
+        let err = r.load().await.expect_err("non-200 refresh must fail");
+
+        assert!(
+            err.to_string().contains("HTTP 401"),
+            "clear refresh error: {err}"
+        );
+        assert_eq!(cache.get(TEST_CACHE_KEY).unwrap(), None);
+        assert_eq!(http.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn prefers_the_freshest_source() {
         // Cache holds a fresh token; bootstrap is expired → cache wins, no refresh.
         let cache = Arc::new(MemSecrets::default());

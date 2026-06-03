@@ -28,3 +28,6 @@ pub use sources::LocalSourceProbe;
 
 /// Keychain service name under which MLT stores its own secrets.
 pub const KEYCHAIN_SERVICE: &str = "com.bigshotpictures.mlt";
+
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
