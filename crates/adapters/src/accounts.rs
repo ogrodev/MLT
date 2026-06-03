@@ -21,6 +21,8 @@ use mlt_core::ports::{OAuthCredentialSource, PortError};
 use mlt_core::providers::codex::token_expiry;
 use mlt_core::sources::DiscoveredAccount;
 
+use crate::resilience::{bounded_blocking_probe, BlockingProbe};
+
 /// One discovered login plus its token, before dedup across stores.
 pub(crate) struct RawAccount {
     pub base: &'static str,
@@ -114,10 +116,19 @@ fn omp_agent_dbs() -> Vec<(String, PathBuf)> {
     dbs
 }
 
-fn omp_accounts(omp_provider: &str, base: &'static str) -> Vec<RawAccount> {
+fn omp_accounts(omp_provider: &'static str, base: &'static str) -> Vec<RawAccount> {
+    let Some(dbs) = bounded_blocking_probe(BlockingProbe::OmpProfiles, || Some(omp_agent_dbs()))
+    else {
+        return Vec::new();
+    };
+
     let mut out = Vec::new();
-    for (profile, db) in omp_agent_dbs() {
-        out.extend(read_omp_db(&db, omp_provider, base, &profile));
+    for (profile, db) in dbs {
+        let rows = bounded_blocking_probe(BlockingProbe::OmpDb, move || {
+            Some(read_omp_db(&db, omp_provider, base, &profile))
+        })
+        .unwrap_or_default();
+        out.extend(rows);
     }
     out
 }
@@ -158,7 +169,7 @@ fn sqlite_immutable_uri(db: &Path) -> String {
 
 fn read_omp_db(
     db: &Path,
-    omp_provider: &str,
+    omp_provider: &'static str,
     base: &'static str,
     profile: &str,
 ) -> Vec<RawAccount> {
@@ -252,10 +263,10 @@ impl OAuthCredentialSource for AccountCredentials {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::MutexGuard;
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::MutexGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct EnvFixture {
@@ -267,7 +278,7 @@ mod tests {
 
     impl EnvFixture {
         fn new(name: &str) -> Self {
-            let guard = crate::TEST_ENV_LOCK.lock().expect("env lock");
+            let guard = crate::TEST_ENV_LOCK.lock();
             let unique = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("time after epoch")

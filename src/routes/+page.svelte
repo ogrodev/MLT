@@ -26,6 +26,7 @@ import {
   selectedAccount,
   snapshotFor,
   sourceActive,
+  sourceTabLabel,
   usageWindowKey,
   type Tone,
   type UsageRecords,
@@ -73,12 +74,10 @@ const TONE: Record<Tone, string> = {
 };
 
 // Tab/title label: a user's custom name wins; multiple per-account logins (Codex, Claude Code)
-// share a provider display name, so their account email disambiguates them; other sources show
-// the provider name.
+// share a provider display name, so their account email/org disambiguates them; other sources
+// show the provider name.
 function tabLabel(s: SourceState): string {
-  if (s.label) return s.label;
-  if (s.id.includes(':')) return s.account?.email ?? s.display_name;
-  return s.display_name;
+  return sourceTabLabel(s);
 }
 
 // Connected providers and the one currently shown. The shown provider falls back to Claude,

@@ -2195,6 +2195,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tokio",
+ "toml 0.8.2",
 ]
 
 [[package]]

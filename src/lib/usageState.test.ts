@@ -12,6 +12,7 @@ import {
   selectedAccount,
   snapshotFor,
   sourceActive,
+  sourceTabLabel,
   type UsageRecords,
   usageWindowKey,
 } from './usageState';
@@ -114,6 +115,33 @@ describe('usage state', () => {
     expect(sourceActive(source({ credential: 'ApiKey', present: false, enabled: true }))).toBe(
       true,
     );
+  });
+
+  it('uses account organization to disambiguate per-account tab labels', () => {
+    expect(
+      sourceTabLabel(
+        source({
+          account: { email: null, organization: 'Acme Team' },
+        }),
+      ),
+    ).toBe('Acme Team');
+    expect(
+      sourceTabLabel(
+        source({
+          account: { email: 'codex@example.com', organization: 'Acme Team' },
+        }),
+      ),
+    ).toBe('codex@example.com');
+    expect(sourceTabLabel(source({ label: 'Work Codex' }))).toBe('Work Codex');
+    expect(
+      sourceTabLabel(
+        source({
+          id: 'openrouter',
+          display_name: 'OpenRouter',
+          account: { email: null, organization: 'Acme Team' },
+        }),
+      ),
+    ).toBe('OpenRouter');
   });
 
   it('keys duplicate custom usage windows without collisions', () => {

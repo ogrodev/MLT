@@ -11,8 +11,10 @@ use mlt_core::providers::codex::{
 };
 use mlt_core::providers::oauth::OAuthRefresher;
 use mlt_core::sources::account_cache_key;
+use toml::Value as TomlValue;
 
 use crate::accounts::{AccountCredentials, RawAccount};
+use crate::resilience::{bounded_blocking_probe, command_stdout, BlockingProbe};
 use crate::{KeyringSecretStore, ReqwestHttp, SystemClock, KEYCHAIN_SERVICE};
 
 /// The base id for Codex sources and accounts.
@@ -20,11 +22,15 @@ const BASE: &str = "codex";
 
 // ── Codex CLI vendor store (~/.codex/auth.json) ────────────────────────────────
 
-fn codex_cli_auth_path() -> Option<PathBuf> {
+fn codex_home_file(name: &str) -> Option<PathBuf> {
     match std::env::var_os("CODEX_HOME") {
-        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir).join("auth.json")),
-        _ => dirs::home_dir().map(|h| h.join(".codex/auth.json")),
+        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir).join(name)),
+        _ => dirs::home_dir().map(|h| h.join(".codex").join(name)),
     }
+}
+
+fn codex_cli_auth_path() -> Option<PathBuf> {
+    codex_home_file("auth.json")
 }
 
 /// Read the Codex CLI's login from `~/.codex/auth.json` as a discoverable account (deduped with
@@ -34,7 +40,9 @@ pub(crate) fn codex_cli_accounts() -> Vec<RawAccount> {
     let Some(path) = codex_cli_auth_path() else {
         return Vec::new();
     };
-    let Ok(raw) = std::fs::read_to_string(&path) else {
+    let Some(raw) = bounded_blocking_probe(BlockingProbe::CodexAuth, move || {
+        std::fs::read_to_string(path).ok()
+    }) else {
         return Vec::new();
     };
     let Ok(tokens) = parse_codex_cli(&raw) else {
@@ -110,12 +118,8 @@ fn pick(obj: &serde_json::Value, snake: &str, camel: &str) -> Option<String> {
 
 /// Best-effort Codex CLI version for an honest `User-Agent: codex_cli_rs/<version>` header.
 pub fn detect_user_agent() -> String {
-    let version = std::process::Command::new("codex")
-        .arg("--version")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
+    let version = command_stdout(BlockingProbe::CodexVersion, "codex", &["--version"])
+        .and_then(|stdout| String::from_utf8(stdout).ok())
         .and_then(|s| {
             // Output is like "codex-cli 0.20.0"; take the first version-looking token.
             s.split_whitespace()
@@ -124,6 +128,44 @@ pub fn detect_user_agent() -> String {
         })
         .unwrap_or_else(|| "unknown".into());
     format!("codex_cli_rs/{version}")
+}
+
+fn codex_usage_url() -> String {
+    resolve_codex_usage_url().unwrap_or_else(|| DEFAULT_USAGE_URL.into())
+}
+
+fn resolve_codex_usage_url() -> Option<String> {
+    let path = codex_home_file("config.toml")?;
+    bounded_blocking_probe(BlockingProbe::CodexConfig, move || {
+        let raw = std::fs::read_to_string(path).ok()?;
+        let value: TomlValue = toml::from_str(&raw).ok()?;
+        usage_url_from_base(value.get("chatgpt_base_url")?.as_str()?)
+    })
+}
+
+fn usage_url_from_base(base: &str) -> Option<String> {
+    let trimmed = base.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut normalized = trimmed.to_string();
+    if is_default_chatgpt_host(trimmed) && !trimmed.contains("/backend-api") {
+        normalized.push_str("/backend-api");
+    }
+    let suffix = if normalized.contains("/backend-api") {
+        "/wham/usage"
+    } else {
+        "/api/codex/usage"
+    };
+    Some(format!("{normalized}{suffix}"))
+}
+
+fn is_default_chatgpt_host(base: &str) -> bool {
+    base == "https://chatgpt.com"
+        || base.starts_with("https://chatgpt.com/")
+        || base == "https://chat.openai.com"
+        || base.starts_with("https://chat.openai.com/")
 }
 
 /// Build a ready-to-run Codex strategy for one account. Credentials resolve to that account's
@@ -149,7 +191,7 @@ pub fn codex_strategy(account_id: &str, identity: Arc<dyn IdentityStore>) -> Cod
         http,
         clock,
         user_agent: detect_user_agent(),
-        usage_url: DEFAULT_USAGE_URL.into(),
+        usage_url: codex_usage_url(),
         identity,
     }
 }
@@ -157,10 +199,10 @@ pub fn codex_strategy(account_id: &str, identity: Arc<dyn IdentityStore>) -> Cod
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::MutexGuard;
     use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::MutexGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct EnvFixture {
@@ -171,7 +213,7 @@ mod tests {
 
     impl EnvFixture {
         fn new(name: &str) -> Self {
-            let guard = crate::TEST_ENV_LOCK.lock().expect("env lock");
+            let guard = crate::TEST_ENV_LOCK.lock();
             let unique = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("time after epoch")
@@ -190,6 +232,10 @@ mod tests {
 
         fn write_auth(&self, raw: &str) {
             fs::write(self.home.join("auth.json"), raw).expect("auth fixture");
+        }
+
+        fn write_config(&self, raw: &str) {
+            fs::write(self.home.join("config.toml"), raw).expect("config fixture");
         }
     }
 
@@ -270,6 +316,60 @@ mod tests {
             codex_cli_accounts().is_empty(),
             "OAuth auth without account_id is not a discoverable account"
         );
+    }
+
+    #[test]
+    fn codex_usage_url_falls_back_without_config() {
+        let _fixture = EnvFixture::new("usage-default");
+
+        assert_eq!(codex_usage_url(), DEFAULT_USAGE_URL);
+    }
+
+    #[test]
+    fn codex_usage_url_honors_backend_api_base() {
+        let fixture = EnvFixture::new("usage-proxy");
+        fixture.write_config(r#"chatgpt_base_url = "https://proxy.example.com/backend-api""#);
+
+        assert_eq!(
+            codex_usage_url(),
+            "https://proxy.example.com/backend-api/wham/usage"
+        );
+    }
+
+    #[test]
+    fn codex_usage_url_trims_slashes_and_does_not_double_backend_api() {
+        assert_eq!(
+            usage_url_from_base("https://chatgpt.com/backend-api///").as_deref(),
+            Some("https://chatgpt.com/backend-api/wham/usage")
+        );
+    }
+
+    #[test]
+    fn codex_usage_url_injects_backend_api_for_default_hosts() {
+        assert_eq!(
+            usage_url_from_base("https://chatgpt.com").as_deref(),
+            Some(DEFAULT_USAGE_URL)
+        );
+        assert_eq!(
+            usage_url_from_base("https://chat.openai.com").as_deref(),
+            Some("https://chat.openai.com/backend-api/wham/usage")
+        );
+    }
+
+    #[test]
+    fn codex_usage_url_matches_codex_api_path_for_bare_proxy() {
+        assert_eq!(
+            usage_url_from_base("https://proxy.example.com").as_deref(),
+            Some("https://proxy.example.com/api/codex/usage")
+        );
+    }
+
+    #[test]
+    fn codex_usage_url_ignores_empty_configured_base() {
+        let fixture = EnvFixture::new("usage-empty");
+        fixture.write_config(r#"chatgpt_base_url = "   ""#);
+
+        assert_eq!(codex_usage_url(), DEFAULT_USAGE_URL);
     }
 
     #[test]

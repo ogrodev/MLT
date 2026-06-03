@@ -75,6 +75,8 @@ jobs:
         run: pnpm exec biome ci .
       - name: Svelte + TypeScript check
         run: pnpm run check
+      - name: Frontend unit tests
+        run: pnpm test
 
   secrets:
     name: Secret scan

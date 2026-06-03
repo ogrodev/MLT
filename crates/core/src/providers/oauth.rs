@@ -135,7 +135,8 @@ fn parse_refresh_response(
         .and_then(|x| x.as_i64())
         .and_then(|secs| secs.checked_mul(1000))
         .and_then(|ms| now.0.checked_add(ms))
-        .map(Timestamp);
+        .map(Timestamp)
+        .ok_or_else(|| PortError::Io("refresh response missing or invalid expires_in".into()))?;
     let scopes = v
         .get("scope")
         .and_then(|x| x.as_str())
@@ -144,7 +145,7 @@ fn parse_refresh_response(
     Ok(OAuthTokens {
         access_token,
         refresh_token,
-        expires_at,
+        expires_at: Some(expires_at),
         scopes,
         subscription_type: base.subscription_type.clone(),
         account_id: base.account_id.clone(),
@@ -335,17 +336,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overflowing_expires_in_is_dropped_not_panicked() {
+    async fn overflowing_expires_in_errors_without_caching() {
         let cache = Arc::new(MemSecrets::default());
         let body = format!(
             r#"{{"access_token":"new-access","expires_in":{}}}"#,
             i64::MAX
         );
         let http = Arc::new(FakeHttp::new(200, &body));
-        let r = refresher(Some(tokens_expiring_at(500)), cache, http, 1_000);
-        let t = r.load().await.unwrap();
-        assert_eq!(t.access_token, "new-access");
-        assert_eq!(t.expires_at, None);
+        let r = refresher(Some(tokens_expiring_at(500)), cache.clone(), http, 1_000);
+
+        let err = r.load().await.expect_err("overflowing expiry must fail");
+
+        assert!(
+            err.to_string().contains("invalid expires_in"),
+            "clear expiry error: {err}"
+        );
+        assert_eq!(cache.get(TEST_CACHE_KEY).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn missing_expires_in_errors_without_caching() {
+        let cache = Arc::new(MemSecrets::default());
+        let http = Arc::new(FakeHttp::new(200, r#"{"access_token":"new-access"}"#));
+        let r = refresher(Some(tokens_expiring_at(500)), cache.clone(), http, 1_000);
+
+        let err = r.load().await.expect_err("missing expiry must fail");
+
+        assert!(
+            err.to_string().contains("invalid expires_in"),
+            "clear expiry error: {err}"
+        );
+        assert_eq!(cache.get(TEST_CACHE_KEY).unwrap(), None);
     }
 
     #[tokio::test]

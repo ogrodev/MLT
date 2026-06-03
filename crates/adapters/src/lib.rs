@@ -12,6 +12,7 @@ pub mod consent;
 pub mod http;
 pub mod identity;
 pub mod labels;
+pub(crate) mod resilience;
 pub mod secrets;
 pub mod sources;
 
@@ -30,4 +31,4 @@ pub use sources::LocalSourceProbe;
 pub const KEYCHAIN_SERVICE: &str = "com.bigshotpictures.mlt";
 
 #[cfg(test)]
-pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static TEST_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());

@@ -19,6 +19,7 @@ use mlt_core::providers::oauth::OAuthRefresher;
 use mlt_core::sources::account_cache_key;
 
 use crate::accounts::AccountCredentials;
+use crate::resilience::{bounded_blocking_probe, command_stdout, BlockingProbe};
 use crate::{KeyringSecretStore, ReqwestHttp, SystemClock, KEYCHAIN_SERVICE};
 
 /// Reads Claude Code's OAuth tokens from `~/.claude/.credentials.json`, falling back to the
@@ -50,7 +51,10 @@ fn path_present(home: &Path) -> bool {
 }
 
 fn file_present() -> bool {
-    dirs::home_dir().map(|h| path_present(&h)).unwrap_or(false)
+    bounded_blocking_probe(BlockingProbe::ClaudeFilePresence, || {
+        dirs::home_dir().map(|h| path_present(&h))
+    })
+    .unwrap_or(false)
 }
 
 #[async_trait]
@@ -59,7 +63,11 @@ impl OAuthCredentialSource for ClaudeCredentials {
         // 1) Plain file (Linux / older macOS setups).
         if let Some(home) = dirs::home_dir() {
             let path = home.join(".claude/.credentials.json");
-            if let Ok(raw) = std::fs::read_to_string(&path) {
+            if let Some(raw) =
+                bounded_blocking_probe(BlockingProbe::ClaudeCredentialsFile, move || {
+                    std::fs::read_to_string(path).ok()
+                })
+            {
                 if let Ok(tokens) = parse_creds(&raw) {
                     return Ok(tokens);
                 }
@@ -123,19 +131,17 @@ fn parse_creds(raw: &str) -> Result<OAuthTokens, String> {
 
 #[cfg(target_os = "macos")]
 fn read_keychain() -> Option<String> {
-    let out = std::process::Command::new("/usr/bin/security")
-        .args([
+    let out = command_stdout(
+        BlockingProbe::ClaudeKeychainRead,
+        "/usr/bin/security",
+        &[
             "find-generic-password",
             "-s",
             "Claude Code-credentials",
             "-w",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        ],
+    )?;
+    let s = String::from_utf8_lossy(&out).trim().to_string();
     if s.is_empty() {
         None
     } else {
@@ -154,11 +160,12 @@ fn read_keychain() -> Option<String> {
 /// passes `-w` to read the token and runs only on the consented `load` path.
 #[cfg(target_os = "macos")]
 fn keychain_present() -> bool {
-    std::process::Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-s", "Claude Code-credentials"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    command_stdout(
+        BlockingProbe::ClaudeKeychainPresence,
+        "/usr/bin/security",
+        &["find-generic-password", "-s", "Claude Code-credentials"],
+    )
+    .is_some()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -169,12 +176,8 @@ fn keychain_present() -> bool {
 /// Best-effort detection of the installed Claude Code CLI version for the required
 /// `User-Agent: claude-code/<version>` header (without it, the endpoint 429s hard).
 pub fn detect_user_agent() -> String {
-    let version = std::process::Command::new("claude")
-        .arg("--version")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
+    let version = command_stdout(BlockingProbe::ClaudeVersion, "claude", &["--version"])
+        .and_then(|stdout| String::from_utf8(stdout).ok())
         .and_then(|s| s.split_whitespace().next().map(String::from))
         .unwrap_or_else(|| "unknown".into());
     format!("claude-code/{version}")

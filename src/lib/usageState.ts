@@ -17,6 +17,14 @@ export function sourceActive(source: SourceState): boolean {
   return source.credential === 'ApiKey' ? source.enabled : source.present && source.enabled;
 }
 
+export function sourceTabLabel(source: SourceState): string {
+  if (source.label) return source.label;
+  if (source.id.includes(':')) {
+    return source.account?.email ?? source.account?.organization ?? source.display_name;
+  }
+  return source.display_name;
+}
+
 export function reportsUsage(id: string): boolean {
   return id === 'claude-code' || id.startsWith('codex:') || id.startsWith('claude-code:');
 }
