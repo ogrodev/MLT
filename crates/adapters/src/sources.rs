@@ -9,7 +9,6 @@ use mlt_core::domain::ProviderId;
 use mlt_core::ports::SourceProbe;
 
 use crate::claude::ClaudeCredentials;
-use crate::codex::CodexCredentials;
 
 /// Probes the real machine for each known source. Unknown ids report absent rather than
 /// erroring, so the catalog can list a source before its probe exists.
@@ -21,7 +20,8 @@ impl SourceProbe for LocalSourceProbe {
     async fn is_present(&self, id: &ProviderId) -> bool {
         match id.as_str() {
             "claude-code" => ClaudeCredentials::is_present(),
-            "codex" => CodexCredentials::is_present(),
+            // Codex logins are discovered per-account from Oh My Pi's store / the Codex CLI
+            // (see `crate::codex::codex_accounts`), so they are present by discovery, not probed.
             _ => false,
         }
     }

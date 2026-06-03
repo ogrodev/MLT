@@ -16,7 +16,7 @@ pub mod sources;
 
 pub use claude::{claude_strategy, ClaudeCredentials};
 pub use clock::SystemClock;
-pub use codex::{codex_strategy, CodexCredentials};
+pub use codex::{codex_accounts, codex_strategy};
 pub use consent::FileConsentStore;
 pub use http::ReqwestHttp;
 pub use identity::FileIdentityStore;

@@ -13,8 +13,8 @@ use mlt_core::ports::{
 use mlt_core::providers::openrouter::validate_key;
 use mlt_core::providers::{FetchContext, FetchStrategy};
 use mlt_core::sources::{
-    active_sources, api_key_secret_key, discover_sources, find_source, source_catalog,
-    CredentialKind, SourceDescriptor, SourceState,
+    active_sources, api_key_secret_key, codex_account_descriptor, codex_source_id,
+    discover_sources, find_source, source_catalog, CredentialKind, SourceDescriptor, SourceState,
 };
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -56,6 +56,54 @@ struct AppSources {
     identity: Arc<dyn IdentityStore>,
 }
 
+/// Resolve a source id to its descriptor: the static catalog for built-in sources, or a
+/// synthesized per-account descriptor for a discovered Codex account (`codex:<account_id>`).
+/// A Codex account's id and cache key are deterministic from the id, so toggling or
+/// disconnecting one needs no store enumeration.
+fn descriptor_for(id: &ProviderId) -> Option<SourceDescriptor> {
+    match id.as_str().strip_prefix("codex:") {
+        Some(account_id) => Some(codex_account_descriptor(account_id)),
+        None => find_source(&source_catalog(), id).cloned(),
+    }
+}
+
+/// Every connect-screen row: the static catalog plus the dynamically-discovered Codex accounts
+/// (Oh My Pi's per-profile store + the Codex CLI, deduped). Enumerating accounts here keeps
+/// every command consistent.
+async fn discover_all(
+    probe: &dyn SourceProbe,
+    consent: &dyn ConsentStore,
+    labels: &dyn SourceLabels,
+    identity: &dyn IdentityStore,
+) -> Result<Vec<SourceState>, String> {
+    discover_sources(
+        &source_catalog(),
+        &mlt_adapters::codex_accounts(),
+        probe,
+        consent,
+        labels,
+        identity,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// The sources the refresh loop may fetch: opted-in (and present, for local logins), including
+/// the discovered Codex accounts (present by discovery).
+async fn active_all(
+    probe: &dyn SourceProbe,
+    consent: &dyn ConsentStore,
+) -> Result<Vec<ProviderId>, String> {
+    active_sources(
+        &source_catalog(),
+        &mlt_adapters::codex_accounts(),
+        probe,
+        consent,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Pure decision for a tray left-click, isolated from Tauri so it is unit-testable.
 ///
 /// Dismissing an open popover by clicking the tray icon first fires a focus-loss that hides
@@ -87,14 +135,9 @@ async fn fetch_usage(
     id: String,
 ) -> Result<UsageSnapshot, String> {
     let provider = ProviderId::new(&id);
-    let connected = active_sources(
-        &source_catalog(),
-        sources.probe.as_ref(),
-        sources.consent.as_ref(),
-    )
-    .await
-    .map_err(|e| e.to_string())?
-    .contains(&provider);
+    let connected = active_all(sources.probe.as_ref(), sources.consent.as_ref())
+        .await?
+        .contains(&provider);
     if !connected {
         return Err(format!("{id} is not connected"));
     }
@@ -108,15 +151,13 @@ async fn fetch_usage(
 /// stored opt-in. Reads no secret.
 #[tauri::command]
 async fn list_sources(sources: tauri::State<'_, AppSources>) -> Result<Vec<SourceState>, String> {
-    discover_sources(
-        &source_catalog(),
+    discover_all(
         sources.probe.as_ref(),
         sources.consent.as_ref(),
         sources.labels.as_ref(),
         sources.identity.as_ref(),
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// Connect or disconnect a local-login source via its consent toggle. Takes effect
@@ -132,8 +173,7 @@ async fn set_source_enabled(
     enabled: bool,
 ) -> Result<Vec<SourceState>, String> {
     let id = ProviderId::new(id);
-    let catalog = source_catalog();
-    let descriptor = find_source(&catalog, &id).ok_or("Unknown source")?;
+    let descriptor = descriptor_for(&id).ok_or("Unknown source")?;
     // API-key sources connect by storing a validated key, not by a bare consent toggle — route
     // them through set_api_key / disconnect_source so consent never diverges from the key.
     if descriptor.credential == CredentialKind::ApiKey {
@@ -151,19 +191,17 @@ async fn set_source_enabled(
             sources.secrets.as_ref(),
             sources.consent.as_ref(),
             sources.identity.as_ref(),
-            descriptor,
+            &descriptor,
         )?;
     }
 
-    discover_sources(
-        &catalog,
+    discover_all(
         sources.probe.as_ref(),
         sources.consent.as_ref(),
         sources.labels.as_ref(),
         sources.identity.as_ref(),
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// Validate, then store an API key and mark the source connected — the testable core of
@@ -240,15 +278,13 @@ async fn set_api_key(
     )
     .await?;
     kick_refresh(&app, &sources);
-    discover_sources(
-        &source_catalog(),
+    discover_all(
         sources.probe.as_ref(),
         sources.consent.as_ref(),
         sources.labels.as_ref(),
         sources.identity.as_ref(),
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// Disconnect any connected source: remove every secret MLT cached for it from the OS keychain,
@@ -263,23 +299,20 @@ async fn disconnect_source(
     id: String,
 ) -> Result<Vec<SourceState>, String> {
     let id = ProviderId::new(id);
-    let catalog = source_catalog();
-    let descriptor = find_source(&catalog, &id).ok_or("Unknown source")?;
+    let descriptor = descriptor_for(&id).ok_or("Unknown source")?;
     disconnect(
         sources.secrets.as_ref(),
         sources.consent.as_ref(),
         sources.identity.as_ref(),
-        descriptor,
+        &descriptor,
     )?;
-    discover_sources(
-        &catalog,
+    discover_all(
         sources.probe.as_ref(),
         sources.consent.as_ref(),
         sources.labels.as_ref(),
         sources.identity.as_ref(),
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// Set (or clear, with a blank string) the user-assigned custom name for a source — shown as
@@ -299,15 +332,13 @@ async fn set_source_label(
         .labels
         .set_label(&id, label)
         .map_err(|e| e.to_string())?;
-    discover_sources(
-        &source_catalog(),
+    discover_all(
         sources.probe.as_ref(),
         sources.consent.as_ref(),
         sources.labels.as_ref(),
         sources.identity.as_ref(),
     )
     .await
-    .map_err(|e| e.to_string())
 }
 
 /// Kick an immediate off-thread refresh of the active sources, so a just-connected source
@@ -339,11 +370,12 @@ async fn claude_usage(
 }
 
 async fn codex_usage(
+    account_id: &str,
     identity: Arc<dyn IdentityStore>,
 ) -> Result<UsageSnapshot, mlt_core::providers::FetchError> {
-    let strategy = mlt_adapters::codex_strategy(identity);
+    let strategy = mlt_adapters::codex_strategy(account_id, identity);
     let ctx = FetchContext {
-        provider: ProviderId::new("codex"),
+        provider: ProviderId::new(codex_source_id(account_id)),
     };
     strategy.fetch(&ctx).await
 }
@@ -354,11 +386,13 @@ async fn fetch_for(
     id: &ProviderId,
     identity: Arc<dyn IdentityStore>,
 ) -> Option<Result<UsageSnapshot, mlt_core::providers::FetchError>> {
-    match id.as_str() {
-        "claude-code" => Some(claude_usage(identity).await),
-        "codex" => Some(codex_usage(identity).await),
-        _ => None,
+    if id.as_str() == "claude-code" {
+        return Some(claude_usage(identity).await);
     }
+    if let Some(account_id) = id.as_str().strip_prefix("codex:") {
+        return Some(codex_usage(account_id, identity).await);
+    }
+    None
 }
 
 /// Payload for the `usage-error` event: which provider failed, and why. Carrying the provider
@@ -379,7 +413,7 @@ async fn refresh_active(
     consent: &dyn ConsentStore,
     identity: Arc<dyn IdentityStore>,
 ) {
-    let Ok(ids) = active_sources(&source_catalog(), probe, consent).await else {
+    let Ok(ids) = active_all(probe, consent).await else {
         return;
     };
     for id in &ids {
@@ -545,7 +579,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_api_key, disconnect};
+    use super::{apply_api_key, descriptor_for, disconnect};
     use super::{popover_action, PopoverAction, REOPEN_DEBOUNCE};
     use async_trait::async_trait;
     use mlt_core::domain::{AccountIdentity, ProviderId};
@@ -840,6 +874,54 @@ mod tests {
             Some("sk-or-v1-keep"),
             "another source's secret is left untouched"
         );
+    }
+
+    #[test]
+    fn disconnect_purges_only_the_targeted_codex_accounts_cached_token() {
+        // Per-account Codex sources: disconnecting one login removes ONLY its namespaced cached
+        // token (oauth.codex.<id>) + its consent + identity, leaving another account's untouched.
+        let secrets = MemSecrets::default();
+        secrets.set("oauth.codex.acct-1", "tok-1").unwrap();
+        secrets.set("oauth.codex.acct-2", "tok-2").unwrap();
+        let consent = FakeConsent::default();
+        let one = ProviderId::new("codex:acct-1");
+        consent.set_enabled(&one, true).unwrap();
+        let identity = MemIdentity::default();
+        identity
+            .set_identity(
+                &one,
+                &AccountIdentity {
+                    email: Some("a@example.com".into()),
+                    organization: None,
+                },
+            )
+            .unwrap();
+
+        // descriptor_for synthesizes the per-account descriptor straight from the id — no store
+        // enumeration needed to disconnect one account.
+        let descriptor = descriptor_for(&one).expect("codex account descriptor");
+        assert_eq!(
+            descriptor.cached_secret_keys(),
+            vec!["oauth.codex.acct-1".to_string()]
+        );
+        disconnect(&secrets, &consent, &identity, &descriptor).expect("disconnect succeeds");
+
+        assert_eq!(
+            secrets.get("oauth.codex.acct-1").unwrap(),
+            None,
+            "this account's token is purged"
+        );
+        assert_eq!(
+            secrets.get("oauth.codex.acct-2").unwrap().as_deref(),
+            Some("tok-2"),
+            "another Codex account's token is left untouched"
+        );
+        assert!(!consent.is_enabled(&one).unwrap());
+        assert_eq!(identity.identity(&one).unwrap(), None);
+
+        // Built-in ids still resolve via the static catalog; unknown ids resolve to nothing.
+        assert!(descriptor_for(&ProviderId::new("claude-code")).is_some());
+        assert!(descriptor_for(&ProviderId::new("nope")).is_none());
     }
 
     #[test]

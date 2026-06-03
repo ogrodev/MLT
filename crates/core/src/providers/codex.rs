@@ -23,9 +23,14 @@ pub const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// Scope the OpenAI token endpoint requires in the refresh body.
 pub const REFRESH_SCOPE: &str = "openid profile email";
-/// Key under which we cache OUR refreshed copy — never written back to `~/.codex/auth.json`,
-/// which MLT only ever reads (AGENTS.md invariant).
-pub const CACHE_KEY: &str = "oauth.codex";
+/// Build the keychain key under which we cache OUR refreshed copy of one account's token,
+/// namespaced by ChatGPT account id so multiple Codex logins never collide. Never written back
+/// to the vendor's own store (`~/.codex/auth.json` or Oh My Pi's DB), which MLT only reads
+/// (AGENTS.md invariant). The connect catalog and the fetch strategy both derive the key from
+/// here, so disconnect purges exactly what the strategy wrote.
+pub fn account_cache_key(account_id: &str) -> String {
+    format!("oauth.codex.{account_id}")
+}
 
 /// The session (5h) and weekly (7d) windows, in minutes. We classify each window by its
 /// reported length rather than trusting its position, so a server that swaps primary/secondary
