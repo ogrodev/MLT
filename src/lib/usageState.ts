@@ -26,7 +26,12 @@ export function sourceTabLabel(source: SourceState): string {
 }
 
 export function reportsUsage(id: string): boolean {
-  return id === 'claude-code' || id.startsWith('codex:') || id.startsWith('claude-code:');
+  return (
+    id === 'claude-code' ||
+    id === 'openrouter' ||
+    id.startsWith('codex:') ||
+    id.startsWith('claude-code:')
+  );
 }
 
 export function resetCountdown(resetsAt: number | null, now: number): string {

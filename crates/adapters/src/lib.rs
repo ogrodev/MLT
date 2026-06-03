@@ -12,6 +12,7 @@ pub mod consent;
 pub mod http;
 pub mod identity;
 pub mod labels;
+pub mod openrouter;
 pub(crate) mod resilience;
 pub mod secrets;
 pub mod sources;
@@ -24,6 +25,7 @@ pub use consent::FileConsentStore;
 pub use http::ReqwestHttp;
 pub use identity::FileIdentityStore;
 pub use labels::FileLabelStore;
+pub use openrouter::openrouter_strategy;
 pub use secrets::KeyringSecretStore;
 pub use sources::LocalSourceProbe;
 

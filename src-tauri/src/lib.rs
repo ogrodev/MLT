@@ -39,6 +39,7 @@ enum PopoverAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UsageRoute<'a> {
     Claude,
+    OpenRouter,
     Codex { account_id: &'a str },
     ClaudeAccount { account_id: &'a str },
 }
@@ -398,10 +399,21 @@ async fn claude_account_usage(
     strategy.fetch(&ctx).await
 }
 
+async fn openrouter_usage() -> Result<UsageSnapshot, mlt_core::providers::FetchError> {
+    let strategy = mlt_adapters::openrouter_strategy();
+    let ctx = FetchContext {
+        provider: ProviderId::new("openrouter"),
+    };
+    strategy.fetch(&ctx).await
+}
+
 fn usage_route(id: &ProviderId) -> Option<UsageRoute<'_>> {
     let id = id.as_str();
     if id == "claude-code" {
         return Some(UsageRoute::Claude);
+    }
+    if id == "openrouter" {
+        return Some(UsageRoute::OpenRouter);
     }
     match id.split_once(':') {
         Some(("codex", account_id)) if !account_id.is_empty() => {
@@ -422,6 +434,7 @@ async fn fetch_for(
 ) -> Option<Result<UsageSnapshot, mlt_core::providers::FetchError>> {
     match usage_route(id)? {
         UsageRoute::Claude => Some(claude_usage(identity).await),
+        UsageRoute::OpenRouter => Some(openrouter_usage().await),
         UsageRoute::Codex { account_id } => Some(codex_usage(account_id, identity).await),
         UsageRoute::ClaudeAccount { account_id } => {
             Some(claude_account_usage(account_id, identity).await)
@@ -762,7 +775,10 @@ mod tests {
                 account_id: "acct-2"
             })
         );
-        assert_eq!(usage_route(&ProviderId::new("openrouter")), None);
+        assert_eq!(
+            usage_route(&ProviderId::new("openrouter")),
+            Some(UsageRoute::OpenRouter)
+        );
         assert_eq!(usage_route(&ProviderId::new("codex")), None);
         assert_eq!(usage_route(&ProviderId::new("codex:")), None);
         assert_eq!(usage_route(&ProviderId::new("claude-code:")), None);

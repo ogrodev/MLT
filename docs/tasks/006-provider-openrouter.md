@@ -2,7 +2,7 @@
 
 > Add my OpenRouter API key and see my credit/usage standing.
 
-**Capability:** [§3 Provider coverage](../PRD.md#3-provider-coverage) · **Status:** ◻ not started · **Depends on:** 003
+**Capability:** [§3 Provider coverage](../PRD.md#3-provider-coverage) · **Status:** ✅ done · **Depends on:** 003
 
 ## User story
 As an OpenRouter user, I want my API usage/credit shown in the popover so I know how much
@@ -13,14 +13,14 @@ headroom I have left.
 - **Out:** Key-entry UI itself (003); other API providers (007, 008).
 
 ## Acceptance criteria
-- [ ] Once a key is connected, OpenRouter shows its **usage/credit** with **percent used**
+- [x] Once a key is connected, OpenRouter shows its **usage/credit** with **percent used**
       (or remaining) and a **reset countdown** where one applies, per §2.
-- [ ] Data **auto-refreshes** with the rest and on opening the popover.
-- [ ] Fetch failure shows a **stale/error** state and retains last known values; other
+- [x] Data **auto-refreshes** with the rest and on opening the popover.
+- [x] Fetch failure shows a **stale/error** state and retains last known values; other
       providers are unaffected.
-- [ ] Where OpenRouter exposes **no reset window** (e.g. prepaid credit), the UI states that
+- [x] Where OpenRouter exposes **no reset window** (e.g. prepaid credit), the UI states that
       **honestly** rather than inventing a countdown.
-- [ ] OpenRouter data stays **siloed** to its own tile.
+- [x] OpenRouter data stays **siloed** to its own tile.
 
 ## Done
 Meets the [shared Definition of Done](./README.md#shared-definition-of-done-applies-to-every-task).
