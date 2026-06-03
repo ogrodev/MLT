@@ -107,10 +107,12 @@ describe('usage state', () => {
       label: 'Stale',
       tone: 'warn',
     });
+    // OpenRouter now reports usage, so before its first fetch it reads as "Connecting…" — not
+    // the generic "Connected" shown for providers that have no usage tracking.
     expect(connectionState(source({ id: 'openrouter', credential: 'ApiKey' }), null, null)).toEqual(
       {
-        label: 'Connected',
-        tone: 'ok',
+        label: 'Connecting…',
+        tone: 'idle',
       },
     );
   });
@@ -119,7 +121,7 @@ describe('usage state', () => {
     expect(reportsUsage('claude-code')).toBe(true);
     expect(reportsUsage('codex:acct-1')).toBe(true);
     expect(reportsUsage('claude-code:acct-2')).toBe(true);
-    expect(reportsUsage('openrouter')).toBe(false);
+    expect(reportsUsage('openrouter')).toBe(true);
 
     expect(sourceActive(source({ credential: 'LocalLogin', present: true, enabled: true }))).toBe(
       true,
