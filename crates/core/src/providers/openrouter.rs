@@ -207,18 +207,22 @@ impl FetchStrategy for OpenRouterStrategy {
             429 => return Err(FetchError::RateLimited),
             s => return Err(FetchError::Upstream(format!("HTTP {s}"))),
         };
-        // The account balance is only the *fallback* bound, so fetch it only when the key has no
-        // usable spend cap of its own. This skips a recurring round-trip on the common capped key
-        // (OpenRouter refuses /credits for a normal inference key anyway). Best-effort: any
-        // non-200 or transport failure degrades to None — never a failed snapshot.
+        // The account balance is only the *fallback* bound, so we fetch it only when the key has
+        // no usable spend cap of its own — skipping a recurring round-trip on the common capped key.
         let credits = if key_cap(key_info.limit).is_some() {
             None
         } else {
-            match self.http.send(bearer_get(CREDITS_URL, &key)).await {
-                Ok(resp) if resp.status == 200 => {
-                    parse_credits(&String::from_utf8_lossy(&resp.body))
-                }
-                _ => None,
+            let resp = self.http.send(bearer_get(CREDITS_URL, &key)).await?;
+            match resp.status {
+                200 => parse_credits(&String::from_utf8_lossy(&resp.body)),
+                // A normal inference key is refused here ("management key required"); that's an
+                // expected fallback, not an outage, so we degrade to the key's own limit/usage.
+                401 | 403 => None,
+                429 => return Err(FetchError::RateLimited),
+                // A genuine operational failure (5xx, or a transport error via `?`) surfaces as an
+                // error so the UI marks the provider Stale/Error rather than falsely asserting a
+                // balance we never actually read.
+                s => return Err(FetchError::Upstream(format!("credits HTTP {s}"))),
             }
         };
         Ok(UsageSnapshot {
@@ -699,6 +703,34 @@ mod tests {
             snap.windows[0].reset_description.as_deref(),
             Some("No spending limit")
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_surfaces_a_credits_server_error_instead_of_faking_no_limit() {
+        // No key cap, so /credits is consulted; a 5xx there is a real outage. It must surface as an
+        // error (UI keeps last-known / shows Error), not collapse into a false "No spending limit".
+        let strat = strategy(
+            Some("k"),
+            ScriptedHttp::new(&[
+                (KEY_URL, 200, r#"{"data":{"limit":null,"usage":5.0}}"#),
+                (CREDITS_URL, 500, ""),
+            ]),
+        );
+        assert!(matches!(
+            strat.fetch(&ctx()).await,
+            Err(FetchError::Upstream(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_surfaces_a_credits_transport_error() {
+        // /key succeeds (no cap) but /credits fails at the transport layer (unscripted URL); that
+        // operational failure must surface, not be swallowed into a confident "No spending limit".
+        let strat = strategy(
+            Some("k"),
+            ScriptedHttp::new(&[(KEY_URL, 200, r#"{"data":{"limit":null,"usage":5.0}}"#)]),
+        );
+        assert!(strat.fetch(&ctx()).await.is_err());
     }
 
     #[tokio::test]
