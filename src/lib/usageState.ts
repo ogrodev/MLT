@@ -73,7 +73,12 @@ export function selectedAccount(
   selected: SourceState | null,
 ): string | null {
   if (!selected) return null;
-  if (snapshot?.account) return snapshot.account.email ?? snapshot.account.organization;
+  // Siloing invariant: only surface the snapshot's identity when it belongs to the
+  // selected provider; never render one provider's identity under another. A mismatched
+  // snapshot falls through to the source's own cached account.
+  if (snapshot?.provider === selected.id && snapshot.account) {
+    return snapshot.account.email ?? snapshot.account.organization;
+  }
   return selected.account?.email ?? selected.account?.organization ?? null;
 }
 

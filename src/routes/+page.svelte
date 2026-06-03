@@ -180,6 +180,9 @@ async function disconnectKeySource(source: SourceState): Promise<void> {
   keyError = null;
   try {
     sources = await disconnectSource(source.id);
+    // Drop its cached usage/error so a later reconnect starts clean, matching the
+    // local-login disable path; otherwise the tile would show the prior session's data.
+    clearUsage(usageRecords, source.id);
   } catch (e) {
     keyError = String(e);
   }

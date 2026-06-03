@@ -72,6 +72,21 @@ describe('usage state', () => {
     expect(selectedAccount(snapshotFor(state, 'codex:acct-1'), codex)).toBeNull();
   });
 
+  it('never renders a cross-provider snapshot identity from selectedAccount', () => {
+    const codex = source({
+      id: 'codex:acct-1',
+      account: { email: 'codex@example.com', organization: null },
+    });
+    // A snapshot belonging to another provider must not leak its identity here.
+    expect(selectedAccount(snapshot('claude-code', 'claude@example.com'), codex)).toBe(
+      'codex@example.com',
+    );
+    // The matching-provider snapshot identity is still preferred.
+    expect(selectedAccount(snapshot('codex:acct-1', 'codex-live@example.com'), codex)).toBe(
+      'codex-live@example.com',
+    );
+  });
+
   it('clears only the provider that receives a fresh usage snapshot', () => {
     const state = records();
     recordUsageError(state, { provider: 'claude-code', message: 'claude failed' });

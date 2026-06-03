@@ -145,7 +145,10 @@ fn resolve_codex_usage_url() -> Option<String> {
 
 fn usage_url_from_base(base: &str) -> Option<String> {
     let trimmed = base.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
+    // HTTPS only: this request carries the OAuth bearer token, so a plaintext
+    // `http://` (or scheme-less) base would leak it on the wire. Reject anything
+    // non-HTTPS so we fall back to the secure default endpoint.
+    if trimmed.is_empty() || !trimmed.starts_with("https://") {
         return None;
     }
 
@@ -368,6 +371,23 @@ mod tests {
     fn codex_usage_url_ignores_empty_configured_base() {
         let fixture = EnvFixture::new("usage-empty");
         fixture.write_config(r#"chatgpt_base_url = "   ""#);
+
+        assert_eq!(codex_usage_url(), DEFAULT_USAGE_URL);
+    }
+
+    #[test]
+    fn codex_usage_url_rejects_non_https_base() {
+        // The usage request carries the OAuth bearer token, so a plaintext or
+        // scheme-less base must never be honored — it would leak the token.
+        assert_eq!(usage_url_from_base("http://proxy.example.com"), None);
+        assert_eq!(usage_url_from_base("http://chatgpt.com"), None);
+        assert_eq!(usage_url_from_base("proxy.example.com"), None);
+    }
+
+    #[test]
+    fn codex_usage_url_falls_back_when_configured_base_is_plaintext() {
+        let fixture = EnvFixture::new("usage-http");
+        fixture.write_config(r#"chatgpt_base_url = "http://proxy.example.com/backend-api""#);
 
         assert_eq!(codex_usage_url(), DEFAULT_USAGE_URL);
     }
