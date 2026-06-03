@@ -16,7 +16,9 @@ use mlt_core::providers::claude::{
     ClaudeCodeStrategy, CACHE_KEY, DEFAULT_CLIENT_ID, DEFAULT_TOKEN_URL,
 };
 use mlt_core::providers::oauth::OAuthRefresher;
+use mlt_core::sources::account_cache_key;
 
+use crate::accounts::AccountCredentials;
 use crate::{KeyringSecretStore, ReqwestHttp, SystemClock, KEYCHAIN_SERVICE};
 
 /// Reads Claude Code's OAuth tokens from `~/.claude/.credentials.json`, falling back to the
@@ -194,6 +196,41 @@ pub fn claude_strategy(identity: Arc<dyn IdentityStore>) -> ClaudeCodeStrategy {
         DEFAULT_TOKEN_URL,
         DEFAULT_CLIENT_ID,
         CACHE_KEY,
+    ));
+    ClaudeCodeStrategy {
+        creds,
+        http,
+        clock,
+        user_agent: detect_user_agent(),
+        identity,
+    }
+}
+
+/// The base id for Claude Code sources and accounts.
+const BASE: &str = "claude-code";
+
+/// Build a ready-to-run Claude Code strategy for one *discovered account* (e.g. an Oh My Pi
+/// anthropic login). Same as [`claude_strategy`], but its bootstrap credential is that account's
+/// token from the shared store, with a per-account cache key — so multiple Claude logins refresh
+/// (into OUR keychain, never Anthropic's) independently. The standalone CLI keychain login keeps
+/// using [`claude_strategy`].
+pub fn claude_account_strategy(
+    account_id: &str,
+    identity: Arc<dyn IdentityStore>,
+) -> ClaudeCodeStrategy {
+    let http: Arc<dyn HttpPort> = Arc::new(ReqwestHttp::new());
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let bootstrap: Arc<dyn OAuthCredentialSource> =
+        Arc::new(AccountCredentials::new(BASE, account_id));
+    let cache: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore::new(KEYCHAIN_SERVICE));
+    let creds: Arc<dyn OAuthCredentialSource> = Arc::new(OAuthRefresher::new(
+        bootstrap,
+        cache,
+        http.clone(),
+        clock.clone(),
+        DEFAULT_TOKEN_URL,
+        DEFAULT_CLIENT_ID,
+        account_cache_key(BASE, account_id),
     ));
     ClaudeCodeStrategy {
         creds,

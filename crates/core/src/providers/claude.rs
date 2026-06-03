@@ -206,14 +206,16 @@ impl FetchStrategy for ClaudeCodeStrategy {
     }
 
     async fn is_available(&self, _ctx: &FetchContext) -> bool {
-        matches!(self.creds.load().await, Ok(t) if t.scopes.iter().any(|s| s == REQUIRED_SCOPE))
+        matches!(self.creds.load().await, Ok(t) if t.scopes.is_empty() || t.scopes.iter().any(|s| s == REQUIRED_SCOPE))
     }
 
     async fn fetch(&self, ctx: &FetchContext) -> Result<UsageSnapshot, FetchError> {
         // The credential source is responsible for returning a *valid* token (refreshing if
-        // needed); we still defend against a missing scope.
+        // needed). Fail fast only when the scopes are *known* and lack `user:profile`; a token
+        // whose scopes we didn't record (e.g. an Oh My Pi account, whose stored blob omits them)
+        // is trusted and the endpoint decides — it 401s if the scope is truly absent.
         let tokens = self.creds.load().await?;
-        if !tokens.scopes.iter().any(|s| s == REQUIRED_SCOPE) {
+        if !tokens.scopes.is_empty() && !tokens.scopes.iter().any(|s| s == REQUIRED_SCOPE) {
             return Err(FetchError::Upstream(
                 "Claude token lacks the user:profile scope required for usage".into(),
             ));
@@ -542,5 +544,33 @@ mod tests {
             1,
             "profile fetched at most once"
         );
+    }
+
+    #[tokio::test]
+    async fn strategy_accepts_a_token_whose_scopes_are_unknown() {
+        // An Oh My Pi account's stored blob omits scopes; the guard must not reject such a token
+        // (the endpoint is the authority). A token with KNOWN scopes lacking user:profile is
+        // still rejected — that path is unchanged.
+        let mut token = tokens_expiring_at(9_999_999_999_999);
+        token.scopes = Vec::new();
+        let strat = ClaudeCodeStrategy {
+            creds: Arc::new(FakeCreds(Some(token))),
+            http: Arc::new(RoutingHttp {
+                profile_body: PROFILE_FIXTURE.into(),
+                profile_calls: AtomicUsize::new(0),
+            }),
+            clock: Arc::new(FakeClock(1)),
+            user_agent: "claude-code/test".into(),
+            identity: Arc::new(FakeIdentity::default()),
+        };
+        let ctx = FetchContext {
+            provider: ProviderId::new("claude-code:acct-1"),
+        };
+        let snap = strat
+            .fetch(&ctx)
+            .await
+            .expect("a token with unknown (empty) scopes is accepted, not rejected");
+        assert_eq!(snap.provider.as_str(), "claude-code:acct-1");
+        assert!(!snap.windows.is_empty(), "usage parsed from the fixture");
     }
 }

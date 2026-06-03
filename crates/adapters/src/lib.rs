@@ -4,6 +4,7 @@
 //! (clock, http, keychain, …) touches the outside world, behind a core port.
 //! See `docs/adr/0006-hexagonal-core.md`.
 
+pub mod accounts;
 pub mod claude;
 pub mod clock;
 pub mod codex;
@@ -14,9 +15,10 @@ pub mod labels;
 pub mod secrets;
 pub mod sources;
 
-pub use claude::{claude_strategy, ClaudeCredentials};
+pub use accounts::discovered_accounts;
+pub use claude::{claude_account_strategy, claude_strategy, ClaudeCredentials};
 pub use clock::SystemClock;
-pub use codex::{codex_accounts, codex_strategy};
+pub use codex::codex_strategy;
 pub use consent::FileConsentStore;
 pub use http::ReqwestHttp;
 pub use identity::FileIdentityStore;

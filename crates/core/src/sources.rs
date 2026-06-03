@@ -141,13 +141,16 @@ pub fn source_catalog() -> Vec<SourceDescriptor> {
     ]
 }
 
-/// One Codex login discovered on this machine — in Oh My Pi's per-profile credential store or
-/// the Codex CLI's `auth.json` — already deduplicated by account. Each becomes its own
-/// per-account [`SourceDescriptor`] so multiple Codex logins are connected and shown
-/// independently. Pure data: the adapter does the IO and constructs these.
+/// One OAuth login discovered for a multi-account provider (Codex, Claude Code) — in Oh My Pi's
+/// per-profile credential store or the vendor CLI's own store — already deduplicated by account.
+/// Each becomes its own per-account [`SourceDescriptor`] so multiple logins are connected and
+/// shown independently. Pure data: the adapter does the IO and constructs these.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CodexAccount {
-    /// ChatGPT account id — stable across profiles and token refreshes; the dedup key and the
+pub struct DiscoveredAccount {
+    /// The base provider this login belongs to: `"codex"` or `"claude-code"`. Drives the
+    /// per-account source id, display name, disclosure, and refreshed-token namespace.
+    pub base: ProviderId,
+    /// Provider account id — stable across profiles and token refreshes; the dedup key and the
     /// source-id suffix.
     pub account_id: String,
     /// Account email for the panel subtitle, when known.
@@ -156,46 +159,80 @@ pub struct CodexAccount {
     pub origin: String,
 }
 
-/// Shared, honest disclosure for every discovered Codex account. The note is identical across
-/// accounts; the email (and origin) tell them apart in the UI.
-pub const CODEX_ACCESS_NOTE: &str =
-    "Reuses a Codex login already on this machine — the OAuth token kept by the Codex CLI \
-     (~/.codex/auth.json) or by Oh My Pi (per profile) — to read that ChatGPT subscription's \
-     Codex usage. The token is never shown, never stored in MLT's database or logs, and is \
-     sent only to OpenAI.";
-
-/// The source id for a Codex account: `codex:<account_id>`. Stable per ChatGPT account, so a
-/// login keeps the same id — and thus the same consent and cached-token namespace — across
-/// refreshes and across the profiles it appears in.
-pub fn codex_source_id(account_id: &str) -> String {
-    format!("codex:{account_id}")
+/// Display metadata for a base provider that supports per-account discovery.
+struct AccountProviderSpec {
+    base: &'static str,
+    display_name: &'static str,
+    access_note: &'static str,
 }
 
-/// Build a connect-screen descriptor for one discovered Codex account. The account id makes
-/// both the source id and the refreshed-token cache key unique, so two Codex logins never
-/// collide in consent, identity, or keychain storage.
-pub fn codex_account_descriptor(account_id: &str) -> SourceDescriptor {
-    SourceDescriptor {
-        id: ProviderId::new(codex_source_id(account_id)),
+/// Honest, per-base disclosures shown before opt-in. Identical across a provider's accounts; the
+/// email (and origin) tell them apart in the UI.
+const CODEX_ACCESS_NOTE: &str = "Reuses a Codex login already on this machine — the OAuth token \
+     kept by the Codex CLI (~/.codex/auth.json) or by Oh My Pi (per profile) — to read that \
+     ChatGPT subscription's Codex usage. The token is never shown, never stored in MLT's \
+     database or logs, and is sent only to OpenAI.";
+const CLAUDE_CODE_ACCESS_NOTE: &str = "Reuses a Claude Code login already on this machine — the \
+     OAuth token kept by Claude Code or by Oh My Pi (per profile) — to read that Claude \
+     subscription's usage. The token is never shown, never stored in MLT's database or logs, \
+     and is sent only to Anthropic.";
+
+/// The providers that expand into per-account sources from local OAuth stores. Registering a new
+/// multi-account provider is one entry here (plus its strategy + store wiring in the adapter).
+const ACCOUNT_PROVIDERS: &[AccountProviderSpec] = &[
+    AccountProviderSpec {
+        base: "codex",
         display_name: "Codex",
         access_note: CODEX_ACCESS_NOTE,
-        credential: CredentialKind::LocalLogin,
-        oauth_cache_key: Some(crate::providers::codex::account_cache_key(account_id)),
-    }
+    },
+    AccountProviderSpec {
+        base: "claude-code",
+        display_name: "Claude Code",
+        access_note: CLAUDE_CODE_ACCESS_NOTE,
+    },
+];
+
+/// The source id for a per-account login: `<base>:<account_id>`. Stable per account, so a login
+/// keeps the same id — and thus the same consent and cached-token namespace — across refreshes
+/// and across the profiles/stores it appears in.
+pub fn account_source_id(base: &str, account_id: &str) -> String {
+    format!("{base}:{account_id}")
 }
 
-/// Build every connect-screen row: probe presence for each known source and pair it with the
-/// stored consent. Presence is checked for *all* sources (the user needs to see what's
-/// available); reading a secret still requires [`SourceState::active`].
+/// The keychain key (under MLT's own service) for OUR refreshed copy of one account's token,
+/// namespaced by base + account id so two logins never collide — never the vendor's own store,
+/// which MLT only reads (AGENTS.md). The catalog and the fetch strategy both derive the key from
+/// here, so disconnect purges exactly what the strategy wrote.
+pub fn account_cache_key(base: &str, account_id: &str) -> String {
+    format!("oauth.{base}.{account_id}")
+}
+
+/// Build the connect-screen descriptor for one discovered account, or `None` if its base isn't a
+/// known multi-account provider. The account id makes the source id and cache key unique, so two
+/// logins never collide in consent, identity, or keychain storage.
+pub fn account_descriptor(base: &str, account_id: &str) -> Option<SourceDescriptor> {
+    let spec = ACCOUNT_PROVIDERS.iter().find(|s| s.base == base)?;
+    Some(SourceDescriptor {
+        id: ProviderId::new(account_source_id(spec.base, account_id)),
+        display_name: spec.display_name,
+        access_note: spec.access_note,
+        credential: CredentialKind::LocalLogin,
+        oauth_cache_key: Some(account_cache_key(spec.base, account_id)),
+    })
+}
+
+/// Build every connect-screen row: probe presence for each static source and pair it with the
+/// stored consent, then expand the discovered per-account logins. Reading a secret still requires
+/// [`SourceState::active`].
 pub async fn discover_sources(
     catalog: &[SourceDescriptor],
-    codex_accounts: &[CodexAccount],
+    accounts: &[DiscoveredAccount],
     probe: &dyn SourceProbe,
     consent: &dyn ConsentStore,
     labels: &dyn SourceLabels,
     identity: &dyn IdentityStore,
 ) -> Result<Vec<SourceState>, PortError> {
-    let mut states = Vec::with_capacity(catalog.len() + codex_accounts.len());
+    let mut states = Vec::with_capacity(catalog.len() + accounts.len());
     for descriptor in catalog {
         let enabled = consent.is_enabled(&descriptor.id)?;
         let present = probe.is_present(&descriptor.id).await;
@@ -204,11 +241,14 @@ pub async fn discover_sources(
         state.account = identity.identity(&descriptor.id)?;
         states.push(state);
     }
-    // Discovered Codex accounts are present by construction (discovery already found the
-    // credential), so they skip the file probe. The email surfaced by discovery seeds the
-    // account subtitle immediately, before any usage fetch resolves identity.
-    for account in codex_accounts {
-        let descriptor = codex_account_descriptor(&account.account_id);
+    // Discovered accounts are present by construction (discovery already found the credential),
+    // so they skip the file probe. The email surfaced by discovery seeds the account subtitle
+    // immediately, before any usage fetch resolves identity.
+    for account in accounts {
+        let Some(descriptor) = account_descriptor(account.base.as_str(), &account.account_id)
+        else {
+            continue;
+        };
         let enabled = consent.is_enabled(&descriptor.id)?;
         let mut state = descriptor.to_state(true, enabled);
         state.label = labels.label(&descriptor.id)?;
@@ -223,12 +263,12 @@ pub async fn discover_sources(
     Ok(states)
 }
 
-/// The sources the refresh loop may actually fetch: opted-in **and** present. Consent is
-/// checked first so a disabled source is never even probed — the presence check stays off
-/// the hot path until the user has consented.
+/// The sources the refresh loop may actually fetch: opted-in **and** present. Consent is checked
+/// first so a disabled source is never even probed — the presence check stays off the hot path
+/// until the user has consented.
 pub async fn active_sources(
     catalog: &[SourceDescriptor],
-    codex_accounts: &[CodexAccount],
+    accounts: &[DiscoveredAccount],
     probe: &dyn SourceProbe,
     consent: &dyn ConsentStore,
 ) -> Result<Vec<ProviderId>, PortError> {
@@ -246,9 +286,12 @@ pub async fn active_sources(
             active.push(descriptor.id.clone());
         }
     }
-    // A discovered Codex account is present by construction, so consent alone gates it.
-    for account in codex_accounts {
-        let id = ProviderId::new(codex_source_id(&account.account_id));
+    // A discovered account is present by construction, so consent alone gates it.
+    for account in accounts {
+        let id = ProviderId::new(account_source_id(
+            account.base.as_str(),
+            &account.account_id,
+        ));
         if consent.is_enabled(&id)? {
             active.push(id);
         }
@@ -385,42 +428,56 @@ mod tests {
     }
 
     #[test]
-    fn codex_account_descriptor_is_a_reused_login_namespaced_per_account() {
-        let d = codex_account_descriptor("acct-123");
-        assert_eq!(d.id.as_str(), "codex:acct-123");
-        assert_eq!(d.credential, CredentialKind::LocalLogin);
-        assert_eq!(d.display_name, "Codex");
-        // Honest disclosure of the reused login + where data goes.
-        let note = d.access_note.to_lowercase();
+    fn account_descriptor_is_a_reused_login_namespaced_per_provider_and_account() {
+        let codex = account_descriptor("codex", "acct-123").expect("codex base is registered");
+        assert_eq!(codex.id.as_str(), "codex:acct-123");
+        assert_eq!(codex.credential, CredentialKind::LocalLogin);
+        assert_eq!(codex.display_name, "Codex");
         assert!(
-            note.contains("oauth") || note.contains("login"),
-            "names the reused credential"
+            codex.access_note.to_lowercase().contains("openai"),
+            "discloses where data goes"
         );
-        assert!(
-            note.contains("openai"),
-            "discloses where usage data is sent"
-        );
-        // OUR refreshed copy is namespaced per account, so two logins never collide; disconnect
-        // purges exactly that key, never the vendor's own store.
         assert_eq!(
-            d.cached_secret_keys(),
+            codex.cached_secret_keys(),
             vec!["oauth.codex.acct-123".to_string()]
         );
-        assert_ne!(codex_account_descriptor("acct-999").id, d.id);
+
+        // The same machinery serves Claude — a distinct base / display / cache namespace.
+        let claude =
+            account_descriptor("claude-code", "acct-123").expect("claude-code is registered");
+        assert_eq!(claude.id.as_str(), "claude-code:acct-123");
+        assert_eq!(claude.display_name, "Claude Code");
+        assert!(
+            claude.access_note.to_lowercase().contains("anthropic"),
+            "discloses where data goes"
+        );
+        assert_eq!(
+            claude.cached_secret_keys(),
+            vec!["oauth.claude-code.acct-123".to_string()]
+        );
+
+        // A different account → a different id; an unregistered base → no descriptor.
+        assert_ne!(
+            account_descriptor("codex", "acct-999").unwrap().id,
+            codex.id
+        );
+        assert!(account_descriptor("mystery", "x").is_none());
     }
 
     #[tokio::test]
-    async fn discovers_codex_accounts_as_present_per_account_sources() {
+    async fn discovers_accounts_across_providers_as_present_per_account_sources() {
         let accounts = [
-            CodexAccount {
+            DiscoveredAccount {
+                base: ProviderId::new("codex"),
                 account_id: "acct-a".into(),
                 email: Some("a@example.com".into()),
                 origin: "Oh My Pi · work".into(),
             },
-            CodexAccount {
+            DiscoveredAccount {
+                base: ProviderId::new("claude-code"),
                 account_id: "acct-b".into(),
                 email: None,
-                origin: "Codex CLI".into(),
+                origin: "Oh My Pi · default".into(),
             },
         ];
         let probe = FakeProbe::default(); // nothing present on disk
@@ -436,12 +493,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(states.len(), 2);
+        // A Codex and a Claude account, each present-by-discovery (never file-probed), enabled
+        // only where consented, email seeded from discovery — one shared code path, both providers.
         let a = states
             .iter()
             .find(|s| s.id.as_str() == "codex:acct-a")
             .unwrap();
-        // Present by discovery (never file-probed), enabled only where consented, and its email
-        // is seeded from discovery without any usage fetch.
         assert!(a.present && a.enabled && a.active());
         assert_eq!(
             a.account.as_ref().and_then(|x| x.email.as_deref()),
@@ -449,7 +506,7 @@ mod tests {
         );
         let b = states
             .iter()
-            .find(|s| s.id.as_str() == "codex:acct-b")
+            .find(|s| s.id.as_str() == "claude-code:acct-b")
             .unwrap();
         assert!(
             b.present && !b.enabled && !b.active(),
@@ -463,7 +520,7 @@ mod tests {
         assert_eq!(
             probe.probes.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "codex accounts are present by discovery and never file-probed"
+            "discovered accounts are present by discovery and never file-probed"
         );
     }
 

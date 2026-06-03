@@ -13,8 +13,8 @@ use mlt_core::ports::{
 use mlt_core::providers::openrouter::validate_key;
 use mlt_core::providers::{FetchContext, FetchStrategy};
 use mlt_core::sources::{
-    active_sources, api_key_secret_key, codex_account_descriptor, codex_source_id,
-    discover_sources, find_source, source_catalog, CredentialKind, SourceDescriptor, SourceState,
+    account_descriptor, account_source_id, active_sources, api_key_secret_key, discover_sources,
+    find_source, source_catalog, CredentialKind, SourceDescriptor, SourceState,
 };
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -61,8 +61,8 @@ struct AppSources {
 /// A Codex account's id and cache key are deterministic from the id, so toggling or
 /// disconnecting one needs no store enumeration.
 fn descriptor_for(id: &ProviderId) -> Option<SourceDescriptor> {
-    match id.as_str().strip_prefix("codex:") {
-        Some(account_id) => Some(codex_account_descriptor(account_id)),
+    match id.as_str().split_once(':') {
+        Some((base, account_id)) => account_descriptor(base, account_id),
         None => find_source(&source_catalog(), id).cloned(),
     }
 }
@@ -78,7 +78,7 @@ async fn discover_all(
 ) -> Result<Vec<SourceState>, String> {
     discover_sources(
         &source_catalog(),
-        &mlt_adapters::codex_accounts(),
+        &mlt_adapters::discovered_accounts(),
         probe,
         consent,
         labels,
@@ -96,7 +96,7 @@ async fn active_all(
 ) -> Result<Vec<ProviderId>, String> {
     active_sources(
         &source_catalog(),
-        &mlt_adapters::codex_accounts(),
+        &mlt_adapters::discovered_accounts(),
         probe,
         consent,
     )
@@ -375,7 +375,18 @@ async fn codex_usage(
 ) -> Result<UsageSnapshot, mlt_core::providers::FetchError> {
     let strategy = mlt_adapters::codex_strategy(account_id, identity);
     let ctx = FetchContext {
-        provider: ProviderId::new(codex_source_id(account_id)),
+        provider: ProviderId::new(account_source_id("codex", account_id)),
+    };
+    strategy.fetch(&ctx).await
+}
+
+async fn claude_account_usage(
+    account_id: &str,
+    identity: Arc<dyn IdentityStore>,
+) -> Result<UsageSnapshot, mlt_core::providers::FetchError> {
+    let strategy = mlt_adapters::claude_account_strategy(account_id, identity);
+    let ctx = FetchContext {
+        provider: ProviderId::new(account_source_id("claude-code", account_id)),
     };
     strategy.fetch(&ctx).await
 }
@@ -386,13 +397,17 @@ async fn fetch_for(
     id: &ProviderId,
     identity: Arc<dyn IdentityStore>,
 ) -> Option<Result<UsageSnapshot, mlt_core::providers::FetchError>> {
-    if id.as_str() == "claude-code" {
+    let id = id.as_str();
+    // The standalone Claude Code CLI login (keychain) is a single static source.
+    if id == "claude-code" {
         return Some(claude_usage(identity).await);
     }
-    if let Some(account_id) = id.as_str().strip_prefix("codex:") {
-        return Some(codex_usage(account_id, identity).await);
+    // Per-account sources are `<base>:<account_id>` — route to that provider's strategy.
+    match id.split_once(':') {
+        Some(("codex", account_id)) => Some(codex_usage(account_id, identity).await),
+        Some(("claude-code", account_id)) => Some(claude_account_usage(account_id, identity).await),
+        _ => None,
     }
-    None
 }
 
 /// Payload for the `usage-error` event: which provider failed, and why. Carrying the provider

@@ -39,6 +39,14 @@ A task is done only when **all** of these are true, in addition to its own accep
 - [ ] **Cross-platform CI lanes pass** for the OSes the task touches (macOS / Windows / Linux).
 - [ ] **New behaviour is covered by tests using fakes/fixtures** — never real provider
       accounts, never live Keychain prompts in `cargo test`.
+- [ ] **Reused-login providers are multi-account by default** ([ADR 0019](../adr/0019-multi-account-discovery.md)):
+      a task that adds an OAuth-subscription provider (one whose login is reused from a local
+      store, like Codex or Claude Code) plugs into the **shared per-account discovery** — it
+      registers the provider in the `ACCOUNT_PROVIDERS` (core) and `PROVIDERS` (adapter) tables
+      and adds a per-account strategy builder, so **every** login (across Oh My Pi profiles + the
+      vendor store, deduped by account id) becomes its own siloed source. It does **not** add a
+      bespoke single-source provider, and it reuses the shared per-account consent / identity /
+      cache-key namespacing. (N/A for API-key or non-provider tasks.)
 - [ ] **Manual QA passes**: a real menu-bar build installs and launches via `make qa`
       (not a dev server), and each acceptance criterion is verified by hand as a user.
 - [ ] **Docs updated**: the [PRD delivery checklist](../PRD.md#delivery-checklist--whats-left-vs-the-original-plan)
