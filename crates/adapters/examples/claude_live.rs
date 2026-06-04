@@ -21,9 +21,13 @@ async fn main() {
     };
 
     match strategy.fetch(&ctx).await {
-        Ok(snapshot) => {
-            println!("{}", serde_json::to_string_pretty(&snapshot).unwrap());
-        }
+        Ok(snapshot) => match serde_json::to_string_pretty(&snapshot) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("failed to serialize snapshot: {e}");
+                std::process::exit(1);
+            }
+        },
         Err(e) => {
             eprintln!("claude usage fetch failed: {e}");
             std::process::exit(1);

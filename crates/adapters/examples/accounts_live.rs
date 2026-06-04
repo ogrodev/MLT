@@ -50,11 +50,13 @@ async fn main() {
             }
         };
         match result {
-            Ok(snapshot) => println!(
-                "\n# [{}] {who}\n{}",
-                a.base.as_str(),
-                serde_json::to_string_pretty(&snapshot).unwrap()
-            ),
+            Ok(snapshot) => match serde_json::to_string_pretty(&snapshot) {
+                Ok(json) => println!("\n# [{}] {who}\n{json}", a.base.as_str()),
+                Err(e) => eprintln!(
+                    "\n# [{}] {who}: snapshot serialization failed: {e}",
+                    a.base.as_str()
+                ),
+            },
             Err(e) => eprintln!("\n# [{}] {who}: usage fetch failed: {e}", a.base.as_str()),
         }
     }

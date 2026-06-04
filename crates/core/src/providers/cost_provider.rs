@@ -2,11 +2,14 @@
 //!
 //! Both are API-cost sources (ADR 0014): the user pastes a normal key, we authenticate it against
 //! a cheap models endpoint, then read 30-day spend from a cost endpoint that exposes a USD total
-//! with **no quota** (PROVIDERS.md). The *decisions* are identical across the two — what an HTTP
-//! status means for key validation and for a cost read, and how the stored key is read from our
-//! keychain — so they live here, pure and unit-tested against fakes. Everything *provider-specific*
-//! stays in each provider module: the endpoint URLs, the auth header shape, the request bodies, the
-//! spend/identity JSON parsers, and the user-facing `Display` wording each maps these verdicts to.
+//! with **no quota** (PROVIDERS.md). Nearly every *decision* is identical across the two — what an
+//! HTTP status means for key validation and for a cost read, and how the stored key is read from
+//! our keychain — so they live here, pure and unit-tested against fakes. The lone cost-read
+//! decision that is *not* shared — which HTTP signal means "needs an org admin key" — is passed in
+//! per provider as [`OrgLimitation`] (Anthropic: a 403; OpenAI: a 401 + body marker, its 403 being
+//! a geo-restriction). Everything else *provider-specific* stays in each provider module: the
+//! endpoint URLs, the auth header shape, the request bodies, the spend JSON parser and its unit
+//! scale, and the user-facing `Display` wording each maps these verdicts to.
 use super::FetchError;
 use crate::domain::{ProviderId, UsageNote};
 use crate::ports::{HttpPort, HttpRequest, SecretStore};
@@ -36,26 +39,28 @@ pub async fn validate_via(http: &dyn HttpPort, request: HttpRequest) -> KeyVerdi
     }
 }
 
-/// What a cost endpoint's HTTP status means for an API-cost provider.
+/// How a provider signals the honest "needs an org admin key" limitation on its **cost** endpoint
+/// — the lone cost-read decision that is *not* shared, because the two providers encode it
+/// differently. Anthropic returns a dedicated **403**; OpenAI overloads **401** with an
+/// `insufficient_permissions` / "Missing scopes" body marker and reserves **403** for a
+/// geo-restriction (an upstream error, never the limitation). Passed to [`cost_note`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CostOutcome {
-    Ok,
-    OrgLimitation,
-    Revoked,
-    RateLimited,
-    Unexpected(u16),
+pub(crate) enum OrgLimitation {
+    /// The limitation is HTTP **403** (Anthropic); a 401 is always a genuine rejection.
+    Forbidden,
+    /// The limitation is HTTP **401** carrying the insufficient-org-scope body marker (OpenAI). A
+    /// 401 with any other body is a genuine rejection, and a 403 is a different upstream failure
+    /// (OpenAI documents it as a geo-restriction) — never the limitation.
+    UnauthorizedWithScopeMarker,
 }
 
-/// Classify a cost-endpoint status: 200=>Ok (parse for spend), 403=>OrgLimitation (authenticated
-/// but no org-usage scope — the honest limitation, not an error), 401=>Revoked, 429=>RateLimited,
-/// else Unexpected.
-pub fn classify_cost_status(status: u16) -> CostOutcome {
-    match status {
-        200 => CostOutcome::Ok,
-        403 => CostOutcome::OrgLimitation,
-        401 => CostOutcome::Revoked,
-        429 => CostOutcome::RateLimited,
-        other => CostOutcome::Unexpected(other),
+impl OrgLimitation {
+    /// True when `(status, body)` is this provider's honest org-admin-key limitation.
+    fn matches(self, status: u16, body: &[u8]) -> bool {
+        match self {
+            Self::Forbidden => status == 403,
+            Self::UnauthorizedWithScopeMarker => status == 401 && is_insufficient_org_scope(body),
+        }
     }
 }
 
@@ -125,43 +130,45 @@ pub(crate) fn sum_spend(report: &serde_json::Value, units_per_usd: f64) -> f64 {
     total / units_per_usd
 }
 
-/// Map a cost-endpoint response to a typed [`UsageNote`] (or a [`FetchError`]) via the shared
-/// cost-status policy ([`classify_cost_status`]): 200 parses the body into a real-spend note, 403
-/// is the honest "needs an org admin key" limitation (never an error or a fake zero), and
-/// 429/other are upstream errors. The body parser is provider-specific (each cost report has
-/// its own struct and unit scale), so it is injected as `parse_usd`; `provider_display` names the
-/// provider in the revoked-key message.
+/// Map a cost-endpoint response to a typed [`UsageNote`] (or a [`FetchError`]). The status policy
+/// is shared; the one provider-specific decision — which HTTP signal means the honest "needs an org
+/// admin key" limitation — is passed in as [`OrgLimitation`]. The body parser is provider-specific
+/// too (each cost report has its own struct and unit scale), so it is injected as `parse_usd`;
+/// `provider_display` names the provider in the revoked-key message.
 ///
-/// A 401 is *usually* a revoked key, but it is re-read against the body first: OpenAI overloads
-/// 401 for an authenticated key that merely lacks the org-usage scope (`insufficient_permissions`
-/// / "Missing scopes"), where Anthropic uses 403. So a 401 whose body carries that marker is the
-/// same honest org-admin-key limitation as a 403 — not a rejection — keeping a valid non-admin key
-/// (the common case, tasks 007/008) from falsely reading as "reconnect it". A genuinely invalid
-/// key carries a different marker (e.g. `invalid_api_key`) and still reads as revoked.
+/// Decisions, in order:
+/// - **200** → parse the body into a real-spend note.
+/// - the provider's org-admin-key limitation ([`OrgLimitation`]) → [`UsageNote::OrgAdminKeyRequired`]:
+///   never an error or a fabricated zero, so a valid non-admin key (the common case, tasks 007/008)
+///   never falsely reads "reconnect it". Anthropic signals it with a 403; OpenAI with a 401 whose
+///   body carries the insufficient-org-scope marker.
+/// - **401** that is *not* that limitation → a revoked-key error naming the provider.
+/// - **429** → [`FetchError::RateLimited`].
+/// - any other status (including OpenAI's geo-restricted **403**) → an upstream error.
 pub(crate) fn cost_note<F>(
     status: u16,
     body: &[u8],
     provider_display: &str,
+    org_limitation: OrgLimitation,
     parse_usd: F,
 ) -> Result<UsageNote, FetchError>
 where
     F: FnOnce(&str) -> Result<f64, FetchError>,
 {
-    match classify_cost_status(status) {
-        CostOutcome::Ok => Ok(UsageNote::ApiSpend {
+    if status == 200 {
+        return Ok(UsageNote::ApiSpend {
             usd: parse_usd(&String::from_utf8_lossy(body))?,
-        }),
-        CostOutcome::OrgLimitation => Ok(UsageNote::OrgAdminKeyRequired),
-        // A 401 carrying the insufficient-org-scope marker is the honest limitation, not a
-        // rejection (OpenAI's non-admin keys land here); anything else is a genuinely revoked key.
-        CostOutcome::Revoked if is_insufficient_org_scope(body) => {
-            Ok(UsageNote::OrgAdminKeyRequired)
-        }
-        CostOutcome::Revoked => Err(FetchError::Upstream(format!(
+        });
+    }
+    if org_limitation.matches(status, body) {
+        return Ok(UsageNote::OrgAdminKeyRequired);
+    }
+    match status {
+        401 => Err(FetchError::Upstream(format!(
             "{provider_display} rejected the key — reconnect it"
         ))),
-        CostOutcome::RateLimited => Err(FetchError::RateLimited),
-        CostOutcome::Unexpected(status) => Err(FetchError::Upstream(format!("HTTP {status}"))),
+        429 => Err(FetchError::RateLimited),
+        other => Err(FetchError::Upstream(format!("HTTP {other}"))),
     }
 }
 
@@ -361,17 +368,6 @@ mod tests {
     }
 
     #[test]
-    fn classify_cost_status_maps_each_status_to_its_outcome() {
-        assert_eq!(classify_cost_status(200), CostOutcome::Ok);
-        // 403 is the honest org limitation, not an error.
-        assert_eq!(classify_cost_status(403), CostOutcome::OrgLimitation);
-        assert_eq!(classify_cost_status(401), CostOutcome::Revoked);
-        assert_eq!(classify_cost_status(429), CostOutcome::RateLimited);
-        assert_eq!(classify_cost_status(418), CostOutcome::Unexpected(418));
-        assert_eq!(classify_cost_status(500), CostOutcome::Unexpected(500));
-    }
-
-    #[test]
     fn read_api_key_returns_the_trimmed_stored_key() {
         let secrets = KeySecrets(Some("  sk-live\n".to_string()));
         assert_eq!(
@@ -455,7 +451,7 @@ mod tests {
 
     #[test]
     fn cost_note_maps_a_200_to_a_parsed_spend_note() {
-        let note = cost_note(200, b"42.0", "OpenAI", |b| {
+        let note = cost_note(200, b"42.0", "OpenAI", OrgLimitation::Forbidden, |b| {
             Ok(b.trim().parse::<f64>().unwrap_or(0.0))
         })
         .expect("200 parses to a note");
@@ -463,27 +459,65 @@ mod tests {
     }
 
     #[test]
-    fn cost_note_maps_403_to_the_honest_limitation_without_parsing() {
-        let note = cost_note(403, b"ignored", "OpenAI", |_| -> Result<f64, FetchError> {
-            unreachable!("403 must never parse the body")
-        })
-        .expect("403 is a note, not an error");
+    fn cost_note_maps_an_anthropic_403_to_the_honest_limitation_without_parsing() {
+        // Anthropic signals the org-admin-key limitation with a 403 — an honest note, never an
+        // error, and the spend parser must never run on it.
+        let note = cost_note(
+            403,
+            b"ignored",
+            "Anthropic",
+            OrgLimitation::Forbidden,
+            |_| -> Result<f64, FetchError> { unreachable!("403 must never parse the body") },
+        )
+        .expect("an Anthropic 403 is the honest limitation, not an error");
         assert_eq!(note, UsageNote::OrgAdminKeyRequired);
     }
 
     #[test]
+    fn cost_note_maps_an_openai_403_to_an_error_not_the_limitation() {
+        // OpenAI reserves 403 for a geo-restriction; its limitation is a 401 + body marker. A 403
+        // here is a genuine upstream error, NOT the org-admin-key note — a regression would make a
+        // geo-blocked OpenAI key look benignly "needs an admin key" with Status::Ok.
+        let err = cost_note(
+            403,
+            b"ignored",
+            "OpenAI",
+            OrgLimitation::UnauthorizedWithScopeMarker,
+            |_| -> Result<f64, FetchError> { unreachable!("403 must never parse the body") },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, FetchError::Upstream(_)),
+            "an OpenAI 403 is a geo-restriction error: {err}"
+        );
+    }
+
+    #[test]
     fn cost_note_maps_revoked_rate_limited_and_unexpected_to_errors() {
-        let revoked = cost_note(401, b"", "Anthropic", |_| Ok(0.0)).unwrap_err();
+        let revoked =
+            cost_note(401, b"", "Anthropic", OrgLimitation::Forbidden, |_| Ok(0.0)).unwrap_err();
         assert!(
             matches!(&revoked, FetchError::Upstream(m) if m.contains("Anthropic")),
             "401 names the provider in the reconnect message: {revoked}"
         );
         assert!(matches!(
-            cost_note(429, b"", "OpenAI", |_| Ok(0.0)),
+            cost_note(
+                429,
+                b"",
+                "OpenAI",
+                OrgLimitation::UnauthorizedWithScopeMarker,
+                |_| Ok(0.0)
+            ),
             Err(FetchError::RateLimited)
         ));
         assert!(matches!(
-            cost_note(500, b"", "OpenAI", |_| Ok(0.0)),
+            cost_note(
+                500,
+                b"",
+                "OpenAI",
+                OrgLimitation::UnauthorizedWithScopeMarker,
+                |_| Ok(0.0)
+            ),
             Err(FetchError::Upstream(_))
         ));
     }
@@ -495,16 +529,26 @@ mod tests {
         // rejection — so a valid non-admin key (the common case) doesn't falsely read "reconnect
         // it". The spend parser must never run on this path.
         let body = br#"{"error":{"type":"insufficient_permissions","code":"insufficient_permissions","message":"You have insufficient permissions for this operation. Missing scopes: api.usage.read"}}"#;
-        let note = cost_note(401, body, "OpenAI", |_| -> Result<f64, FetchError> {
-            unreachable!("a limitation 401 must never parse the body")
-        })
+        let note = cost_note(
+            401,
+            body,
+            "OpenAI",
+            OrgLimitation::UnauthorizedWithScopeMarker,
+            |_| -> Result<f64, FetchError> {
+                unreachable!("a limitation 401 must never parse the body")
+            },
+        )
         .expect("an insufficient-permissions 401 is the honest limitation, not an error");
         assert_eq!(note, UsageNote::OrgAdminKeyRequired);
 
         // The prose "Missing scopes" message alone (no type token) trips it too.
-        let note = cost_note(401, b"Missing scopes: api.usage.read", "OpenAI", |_| {
-            Ok(0.0)
-        })
+        let note = cost_note(
+            401,
+            b"Missing scopes: api.usage.read",
+            "OpenAI",
+            OrgLimitation::UnauthorizedWithScopeMarker,
+            |_| Ok(0.0),
+        )
         .expect("the missing-scopes marker is enough");
         assert_eq!(note, UsageNote::OrgAdminKeyRequired);
     }
@@ -517,6 +561,7 @@ mod tests {
             401,
             br#"{"error":{"code":"invalid_api_key","message":"Incorrect API key provided"}}"#,
             "OpenAI",
+            OrgLimitation::UnauthorizedWithScopeMarker,
             |_| Ok(0.0),
         )
         .unwrap_err();
@@ -528,7 +573,7 @@ mod tests {
 
     #[test]
     fn cost_note_propagates_a_parser_error_on_200() {
-        let err = cost_note(200, b"garbage", "OpenAI", |_| {
+        let err = cost_note(200, b"garbage", "OpenAI", OrgLimitation::Forbidden, |_| {
             Err(FetchError::Upstream("bad json".into()))
         })
         .unwrap_err();
