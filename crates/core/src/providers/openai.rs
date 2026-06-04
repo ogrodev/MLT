@@ -11,30 +11,26 @@
 //!   200 (lists models) and a 403 (authenticates but this scope can't list them) both mean a
 //!   *valid* key; only a 401 is a real rejection.
 //! - **Usage** ([`OpenAiStrategy`]): poll `GET /v1/organization/costs` for the last ~30 days of
-//!   spend. On 200 we report the **real USD total as an honest text note** — never a percentage
+//!   spend. On 200 we report the **real USD total as a typed note** — never a percentage
 //!   bar, because these endpoints expose spend with no quota, so a percent would be invented
-//!   (ADR 0015). On 403 (the common non-admin key) we report the limitation honestly, as a note,
-//!   with no window — which is *not* an error.
+//!   (ADR 0015). On 403 (the common non-admin key) we report the limitation honestly, as a typed
+//!   note, with no window — which is *not* an error.
 //!
 //! All HTTP IO is injected via [`HttpPort`] and the key is read via [`SecretStore`], so the
 //! parsing/decision logic is pure and unit-tested against fakes — no live account is touched in
 //! `cargo test` (a live check is the hand-run `openai_live` example).
-use crate::domain::{Status, Timestamp, UsageSnapshot};
+use crate::domain::{Status, Timestamp, UsageNote, UsageSnapshot};
 use crate::ports::{Clock, HttpPort, HttpRequest, SecretStore};
-use crate::sources::api_key_secret_key;
 use async_trait::async_trait;
 use std::sync::Arc;
 
+use super::cost_provider::{self, CostOutcome, KeyVerdict};
 use super::{FetchContext, FetchError, FetchKind, FetchStrategy};
 
 /// OpenAI's model-list endpoint. A 200 authenticated GET proves the key works; it is the cheapest
 /// call every key can make (used by [`validate_key`]). It carries no usage — billing lives behind
 /// the Admin-only org endpoints ([`costs_url`]).
 pub const MODELS_URL: &str = "https://api.openai.com/v1/models";
-
-/// The honest, user-facing note shown on the tile when a normal key cannot read org usage (HTTP
-/// 403 at [`costs_url`]). Shown verbatim instead of a fabricated 0% bar (tasks 007/008, ADR 0015).
-pub const LIMITATION_NOTE: &str = "This key can't read organization usage. OpenAI exposes API usage and cost only to an organization admin key (sk-admin…), which individual accounts usually can't create.";
 
 /// Why a pasted API key could not be accepted. The `Display` text is **user-facing** — it is
 /// what the popover shows — so each variant reads as a clear, actionable message (acceptance:
@@ -66,15 +62,11 @@ pub async fn validate_key(http: &dyn HttpPort, key: &str) -> Result<(), ApiKeyEr
     if key.is_empty() {
         return Err(ApiKeyError::Empty);
     }
-    match http.send(bearer_get(MODELS_URL, key)).await {
-        Ok(resp) => match resp.status {
-            // 200: the key lists models. 403: it authenticates but this org/scope can't — still a
-            // valid key, so we accept it rather than reject a working credential.
-            200 | 403 => Ok(()),
-            401 => Err(ApiKeyError::Rejected),
-            other => Err(ApiKeyError::Unexpected(other)),
-        },
-        Err(_) => Err(ApiKeyError::Unreachable),
+    match cost_provider::validate_via(http, bearer_get(MODELS_URL, key)).await {
+        KeyVerdict::Ok => Ok(()),
+        KeyVerdict::Rejected => Err(ApiKeyError::Rejected),
+        KeyVerdict::Unreachable => Err(ApiKeyError::Unreachable),
+        KeyVerdict::Unexpected(status) => Err(ApiKeyError::Unexpected(status)),
     }
 }
 
@@ -112,7 +104,7 @@ fn amount_usd(amount: &serde_json::Value) -> f64 {
         _ => 0.0,
     };
     // A numeric string can parse to a non-finite f64 ("NaN", "inf"); flatten it to 0.0 so it can
-    // never poison the sum or the user-facing note (ADR 0015 lossy decoding; matches Anthropic).
+    // never poison the sum or typed usage note (ADR 0015 lossy decoding; matches Anthropic).
     if value.is_finite() {
         value
     } else {
@@ -139,13 +131,6 @@ pub fn parse_costs(body: &str) -> Result<Costs, FetchError> {
         .map(amount_usd)
         .sum();
     Ok(Costs { total_spend_usd })
-}
-
-/// The honest spend note for a 200 cost report: the real 30-day USD total as plain text. We show
-/// it as a note rather than a percentage bar because these endpoints expose spend with **no
-/// quota**, so any percentage would be invented — and we refuse to invent one (ADR 0015).
-pub fn spend_note(total_spend_usd: f64) -> String {
-    format!("API spend: ${total_spend_usd:.2} over the last 30 days.")
 }
 
 /// A bearer-authenticated `GET` of `url` asking for JSON. Shared by the models and cost calls.
@@ -182,33 +167,35 @@ impl FetchStrategy for OpenAiStrategy {
     }
 
     async fn is_available(&self, ctx: &FetchContext) -> bool {
-        self.api_key(ctx).is_some()
+        cost_provider::read_api_key(self.secrets.as_ref(), &ctx.provider).is_some()
     }
 
     async fn fetch(&self, ctx: &FetchContext) -> Result<UsageSnapshot, FetchError> {
-        let key = self.api_key(ctx).ok_or(FetchError::Unavailable)?;
+        let key = cost_provider::read_api_key(self.secrets.as_ref(), &ctx.provider)
+            .ok_or(FetchError::Unavailable)?;
         let now = self.clock.now();
         let resp = self.http.send(bearer_get(&costs_url(now), &key)).await?;
-        let note = match resp.status {
-            // 200: a real spend total — shown as an honest note, never a fabricated 0% bar.
-            200 => spend_note(parse_costs(&String::from_utf8_lossy(&resp.body))?.total_spend_usd),
-            // 403 ≠ 401 here, deliberately: `validate_key` already proved this key authenticates
-            // against /v1/models, so a 403 at the org-cost endpoint means "valid key, lacks the
-            // org-usage scope" — the common non-admin key. That is an honest limitation we state
-            // plainly (Status::Ok, no window, a note), not an error and not a fake 0% window.
-            // A 401 (below) means the key was since revoked — a real error.
-            403 => LIMITATION_NOTE.to_string(),
-            401 => {
+        let note = match cost_provider::classify_cost_status(resp.status) {
+            CostOutcome::Ok => {
+                let costs = parse_costs(&String::from_utf8_lossy(&resp.body))?;
+                UsageNote::ApiSpend {
+                    usd: costs.total_spend_usd,
+                }
+            }
+            CostOutcome::OrgLimitation => UsageNote::OrgAdminKeyRequired,
+            CostOutcome::Revoked => {
                 return Err(FetchError::Upstream(
                     "OpenAI rejected the key — reconnect it".into(),
                 ))
             }
-            429 => return Err(FetchError::RateLimited),
-            s => return Err(FetchError::Upstream(format!("HTTP {s}"))),
+            CostOutcome::RateLimited => return Err(FetchError::RateLimited),
+            CostOutcome::Unexpected(status) => {
+                return Err(FetchError::Upstream(format!("HTTP {status}")))
+            }
         };
         Ok(UsageSnapshot {
             provider: ctx.provider.clone(),
-            windows: vec![],
+            windows: Vec::new(),
             status: Status::Ok,
             fetched_at: now,
             account: None,
@@ -221,89 +208,27 @@ impl FetchStrategy for OpenAiStrategy {
     }
 }
 
-impl OpenAiStrategy {
-    /// The user-entered key from our keychain for this source — trimmed and non-empty — or
-    /// `None` when the source isn't connected (no key stored), which reads as "unavailable".
-    fn api_key(&self, ctx: &FetchContext) -> Option<String> {
-        self.secrets
-            .get(&api_key_secret_key(&ctx.provider))
-            .ok()
-            .flatten()
-            .map(|key| key.trim().to_string())
-            .filter(|key| !key.is_empty())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::UsageNote;
     use crate::domain::{ProviderId, Timestamp};
-    use crate::ports::{HttpResponse, PortError};
-    use async_trait::async_trait;
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::providers::cost_provider::test_support::{
+        has_header, sent_request, FakeClock, FakeHttp, KeySecrets, ScriptedHttp,
+    };
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
-    use std::sync::Mutex;
-
-    /// Scripts one HTTP outcome, records how many requests were sent, and captures the last
-    /// request so a test can assert exactly what hit the wire.
-    struct FakeHttp {
-        outcome: Result<u16, ()>,
-        calls: AtomicUsize,
-        last: Mutex<Option<HttpRequest>>,
-    }
-    impl FakeHttp {
-        fn status(status: u16) -> Self {
-            Self {
-                outcome: Ok(status),
-                calls: AtomicUsize::new(0),
-                last: Mutex::new(None),
-            }
-        }
-        fn transport_error() -> Self {
-            Self {
-                outcome: Err(()),
-                calls: AtomicUsize::new(0),
-                last: Mutex::new(None),
-            }
-        }
-    }
-    #[async_trait]
-    impl HttpPort for FakeHttp {
-        async fn send(&self, req: HttpRequest) -> Result<HttpResponse, PortError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            *self.last.lock().unwrap() = Some(req);
-            match self.outcome {
-                Ok(status) => Ok(HttpResponse {
-                    status,
-                    body: Vec::new(),
-                }),
-                Err(()) => Err(PortError::Io("offline".into())),
-            }
-        }
-    }
 
     #[tokio::test]
     async fn accepts_a_key_the_endpoint_authenticates() {
         let http = FakeHttp::status(200);
         assert_eq!(validate_key(&http, "sk-good").await, Ok(()));
         // One authenticated GET to the models endpoint, carrying the bearer token.
-        let req = http
-            .last
-            .lock()
-            .unwrap()
-            .take()
-            .expect("a request was sent");
+        let req = sent_request(&http);
         assert_eq!(req.method, "GET");
         assert_eq!(req.url, MODELS_URL);
-        assert!(req
-            .headers
-            .iter()
-            .any(|(k, v)| k == "Authorization" && v == "Bearer sk-good"));
-        assert!(req
-            .headers
-            .iter()
-            .any(|(k, v)| k == "Accept" && v == "application/json"));
+        assert!(has_header(&req, "Authorization", "Bearer sk-good"));
+        assert!(has_header(&req, "Accept", "application/json"));
     }
 
     #[tokio::test]
@@ -363,70 +288,11 @@ mod tests {
     async fn trims_surrounding_whitespace_from_a_pasted_key() {
         let http = FakeHttp::status(200);
         assert_eq!(validate_key(&http, "  sk-good\n").await, Ok(()));
-        let req = http
-            .last
-            .lock()
-            .unwrap()
-            .take()
-            .expect("a request was sent");
-        assert!(req.headers.iter().any(|(_, v)| v == "Bearer sk-good"));
+        let req = sent_request(&http);
+        assert!(has_header(&req, "Authorization", "Bearer sk-good"));
     }
 
     // ── Usage reading (task 007) ───────────────────────────────────────────────
-
-    /// Maps a request URL to a scripted `(status, body)` and records every request. An
-    /// unscripted URL fails as a transport error, so a test exercises the transport-error path
-    /// simply by scripting nothing.
-    struct ScriptedHttp {
-        routes: HashMap<String, (u16, String)>,
-        sent: Mutex<Vec<HttpRequest>>,
-    }
-    impl ScriptedHttp {
-        fn new(routes: &[(&str, u16, &str)]) -> Self {
-            Self {
-                routes: routes
-                    .iter()
-                    .map(|(url, status, body)| ((*url).to_string(), (*status, (*body).to_string())))
-                    .collect(),
-                sent: Mutex::new(Vec::new()),
-            }
-        }
-    }
-    #[async_trait]
-    impl HttpPort for ScriptedHttp {
-        async fn send(&self, req: HttpRequest) -> Result<HttpResponse, PortError> {
-            let routed = self.routes.get(&req.url).cloned();
-            self.sent.lock().unwrap().push(req);
-            match routed {
-                Some((status, body)) => Ok(HttpResponse {
-                    status,
-                    body: body.into_bytes(),
-                }),
-                None => Err(PortError::Io("unscripted url".into())),
-            }
-        }
-    }
-
-    /// A keychain stub returning a fixed (or absent) key for any entry name.
-    struct KeySecrets(Option<String>);
-    impl SecretStore for KeySecrets {
-        fn get(&self, _key: &str) -> Result<Option<String>, PortError> {
-            Ok(self.0.clone())
-        }
-        fn set(&self, _key: &str, _value: &str) -> Result<(), PortError> {
-            Ok(())
-        }
-        fn delete(&self, _key: &str) -> Result<(), PortError> {
-            Ok(())
-        }
-    }
-
-    struct FakeClock(i64);
-    impl Clock for FakeClock {
-        fn now(&self) -> Timestamp {
-            Timestamp(self.0)
-        }
-    }
 
     const FETCHED_AT: i64 = 1_700_000_000_000;
 
@@ -501,7 +367,7 @@ mod tests {
     #[test]
     fn parse_costs_drops_non_finite_string_amounts() {
         // A numeric string like "NaN"/"inf" parses to a non-finite f64; it must be dropped (0.0),
-        // never propagated into the total or a "$NaN"/"$inf" note. Only the real 4.00 counts.
+        // never propagated into the total. Only the real 4.00 counts.
         let body = r#"{"data":[{"results":[
             {"amount":{"value":"NaN"}},
             {"amount":{"value":"inf"}},
@@ -514,16 +380,6 @@ mod tests {
             "non-finite amounts must not propagate"
         );
         assert_eq!(costs.total_spend_usd, 4.00);
-        assert_eq!(
-            spend_note(costs.total_spend_usd),
-            "API spend: $4.00 over the last 30 days."
-        );
-    }
-
-    #[test]
-    fn spend_note_states_the_real_total_to_the_cent() {
-        assert_eq!(spend_note(12.5), "API spend: $12.50 over the last 30 days.");
-        assert_eq!(spend_note(0.0), "API spend: $0.00 over the last 30 days.");
     }
 
     #[tokio::test]
@@ -549,20 +405,14 @@ mod tests {
             snap.windows.is_empty(),
             "spend is shown as a note, never a fabricated percentage bar"
         );
-        assert_eq!(
-            snap.note.as_deref(),
-            Some("API spend: $12.50 over the last 30 days.")
-        );
         assert_eq!(snap.fetched_at, Timestamp(FETCHED_AT));
+        assert_eq!(snap.note, Some(UsageNote::ApiSpend { usd: 12.50 }));
         // A single bearer GET to the cost endpoint.
-        let sent = http.sent.lock().unwrap();
+        let sent = http.sent.lock();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].method, "GET");
         assert_eq!(sent[0].url, url);
-        assert!(sent[0]
-            .headers
-            .iter()
-            .any(|(k, v)| k == "Authorization" && v == "Bearer sk-good"));
+        assert!(has_header(&sent[0], "Authorization", "Bearer sk-good"));
     }
 
     #[tokio::test]
@@ -580,7 +430,7 @@ mod tests {
             .expect("403 is an honest note, not an error");
         assert_eq!(snap.status, Status::Ok);
         assert!(snap.windows.is_empty());
-        assert_eq!(snap.note.as_deref(), Some(LIMITATION_NOTE));
+        assert_eq!(snap.note, Some(UsageNote::OrgAdminKeyRequired));
     }
 
     #[tokio::test]

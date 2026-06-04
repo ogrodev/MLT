@@ -23,13 +23,12 @@
 //! All HTTP IO is injected via [`HttpPort`] and the key is read via [`SecretStore`], so the
 //! parsing/decision logic is pure and unit-tested against fakes — no live account is touched in
 //! `cargo test` (a live check is the hand-run `anthropic_live` example).
-use crate::domain::{Status, Timestamp, UsageSnapshot};
+use crate::domain::{Status, Timestamp, UsageNote, UsageSnapshot};
 use crate::ports::{Clock, HttpPort, HttpRequest, SecretStore};
-use crate::sources::api_key_secret_key;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use super::{FetchContext, FetchError, FetchKind, FetchStrategy};
+use super::{cost_provider, FetchContext, FetchError, FetchKind, FetchStrategy};
 
 /// Anthropic's model-list endpoint. An authenticated GET that answers 200 (or 403) proves the
 /// key works without needing org scope, so it is the cheapest call for [`validate_key`].
@@ -69,10 +68,6 @@ fn day_start_rfc3339(ts: Timestamp) -> String {
     format!("{year:04}-{month:02}-{day:02}T00:00:00Z")
 }
 
-/// The honest note shown when the key authenticates but cannot read org usage (a 403 at the cost
-/// endpoint). Shown verbatim on the tile instead of a misleading number (task 008 AC).
-pub const LIMITATION_NOTE: &str = "This key can't read organization usage. Anthropic exposes API usage and cost only to an organization admin key (sk-ant-admin…), which individual accounts usually can't create.";
-
 /// The dated API contract every Anthropic request must declare via the `anthropic-version` header.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -107,13 +102,11 @@ pub async fn validate_key(http: &dyn HttpPort, key: &str) -> Result<(), ApiKeyEr
     if key.is_empty() {
         return Err(ApiKeyError::Empty);
     }
-    match http.send(anthropic_get(MODELS_URL, key)).await {
-        Ok(resp) => match resp.status {
-            200 | 403 => Ok(()),
-            401 => Err(ApiKeyError::Rejected),
-            other => Err(ApiKeyError::Unexpected(other)),
-        },
-        Err(_) => Err(ApiKeyError::Unreachable),
+    match cost_provider::validate_via(http, anthropic_get(MODELS_URL, key)).await {
+        cost_provider::KeyVerdict::Ok => Ok(()),
+        cost_provider::KeyVerdict::Rejected => Err(ApiKeyError::Rejected),
+        cost_provider::KeyVerdict::Unreachable => Err(ApiKeyError::Unreachable),
+        cost_provider::KeyVerdict::Unexpected(status) => Err(ApiKeyError::Unexpected(status)),
     }
 }
 
@@ -176,13 +169,6 @@ pub fn parse_cost_report(body: &str) -> Result<CostReport, FetchError> {
     })
 }
 
-/// The honest, user-facing note for a successful cost read: the **real** USD spend as text, never
-/// a percentage bar — these endpoints expose spend with no quota, so a percent would be invented,
-/// and we refuse to invent one (task 008 AC). Pure formatting, unit-tested apart from any IO.
-pub fn spend_note(total_spend_usd: f64) -> String {
-    format!("API spend: ${total_spend_usd:.2} over the last 30 days.")
-}
-
 /// An Anthropic-authenticated `GET` of `url` asking for JSON. Emits the three headers every
 /// Anthropic API call needs — `x-api-key`, the dated `anthropic-version`, and `Accept` — shared
 /// by validation and the cost read (mirrors OpenRouter's `bearer_get`, with Anthropic's scheme).
@@ -220,33 +206,34 @@ impl FetchStrategy for AnthropicStrategy {
     }
 
     async fn is_available(&self, ctx: &FetchContext) -> bool {
-        self.api_key(ctx).is_some()
+        cost_provider::read_api_key(self.secrets.as_ref(), &ctx.provider).is_some()
     }
 
     async fn fetch(&self, ctx: &FetchContext) -> Result<UsageSnapshot, FetchError> {
-        let key = self.api_key(ctx).ok_or(FetchError::Unavailable)?;
+        let key = cost_provider::read_api_key(self.secrets.as_ref(), &ctx.provider)
+            .ok_or(FetchError::Unavailable)?;
         let now = self.clock.now();
         let resp = self
             .http
             .send(anthropic_get(&cost_report_url(now), &key))
             .await?;
-        let note = match resp.status {
-            200 => {
+        let note = match cost_provider::classify_cost_status(resp.status) {
+            cost_provider::CostOutcome::Ok => {
                 let report = parse_cost_report(&String::from_utf8_lossy(&resp.body))?;
-                spend_note(report.total_spend_usd)
+                UsageNote::ApiSpend {
+                    usd: report.total_spend_usd,
+                }
             }
-            // 403 is the honest limitation, NOT an error — and that is exactly why it diverges
-            // from 401. `validate_key` already proved this key authenticates against `/v1/models`,
-            // so a 403 *here* means "valid key, lacks the org-usage scope" — i.e. a normal,
-            // non-admin key. A 401 below is different: the key was since revoked, a real error.
-            403 => LIMITATION_NOTE.to_string(),
-            401 => {
+            cost_provider::CostOutcome::OrgLimitation => UsageNote::OrgAdminKeyRequired,
+            cost_provider::CostOutcome::Revoked => {
                 return Err(FetchError::Upstream(
                     "Anthropic rejected the key — reconnect it".into(),
                 ))
             }
-            429 => return Err(FetchError::RateLimited),
-            s => return Err(FetchError::Upstream(format!("HTTP {s}"))),
+            cost_provider::CostOutcome::RateLimited => return Err(FetchError::RateLimited),
+            cost_provider::CostOutcome::Unexpected(status) => {
+                return Err(FetchError::Upstream(format!("HTTP {status}")))
+            }
         };
         Ok(UsageSnapshot {
             provider: ctx.provider.clone(),
@@ -265,77 +252,15 @@ impl FetchStrategy for AnthropicStrategy {
     }
 }
 
-impl AnthropicStrategy {
-    /// The user-entered key from our keychain for this source — trimmed and non-empty — or
-    /// `None` when the source isn't connected (no key stored), which reads as "unavailable".
-    fn api_key(&self, ctx: &FetchContext) -> Option<String> {
-        self.secrets
-            .get(&api_key_secret_key(&ctx.provider))
-            .ok()
-            .flatten()
-            .map(|key| key.trim().to_string())
-            .filter(|key| !key.is_empty())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{ProviderId, Timestamp};
-    use crate::ports::{HttpResponse, PortError};
-    use async_trait::async_trait;
-    use parking_lot::Mutex;
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::domain::{ProviderId, Timestamp, UsageNote};
+    use crate::providers::cost_provider::test_support::{
+        has_header, sent_request, FakeClock, FakeHttp, KeySecrets, ScriptedHttp,
+    };
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
-
-    /// Scripts one HTTP outcome, records how many requests were sent, and captures the last
-    /// request so a test can assert exactly what hit the wire.
-    struct FakeHttp {
-        outcome: Result<u16, ()>,
-        calls: AtomicUsize,
-        last: Mutex<Option<HttpRequest>>,
-    }
-    impl FakeHttp {
-        fn status(status: u16) -> Self {
-            Self {
-                outcome: Ok(status),
-                calls: AtomicUsize::new(0),
-                last: Mutex::new(None),
-            }
-        }
-        fn transport_error() -> Self {
-            Self {
-                outcome: Err(()),
-                calls: AtomicUsize::new(0),
-                last: Mutex::new(None),
-            }
-        }
-    }
-    #[async_trait]
-    impl HttpPort for FakeHttp {
-        async fn send(&self, req: HttpRequest) -> Result<HttpResponse, PortError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            *self.last.lock() = Some(req);
-            match self.outcome {
-                Ok(status) => Ok(HttpResponse {
-                    status,
-                    body: Vec::new(),
-                }),
-                Err(()) => Err(PortError::Io("offline".into())),
-            }
-        }
-    }
-
-    /// Takes the captured request out of a [`FakeHttp`], asserting one was actually sent.
-    fn sent_request(http: &FakeHttp) -> HttpRequest {
-        http.last.lock().take().expect("a request was sent")
-    }
-
-    /// Whether a request carries a header with exactly this name and value.
-    fn has_header(req: &HttpRequest, name: &str, value: &str) -> bool {
-        req.headers.iter().any(|(k, v)| k == name && v == value)
-    }
 
     #[tokio::test]
     async fn accepts_a_key_the_endpoint_authenticates() {
@@ -411,59 +336,6 @@ mod tests {
 
     // ── Usage reading (task 008) ───────────────────────────────────────────────
 
-    /// Maps a request URL to a scripted `(status, body)` and records every request. An
-    /// unscripted URL fails as a transport error, exercising the strategy's error path.
-    struct ScriptedHttp {
-        routes: HashMap<String, (u16, String)>,
-        sent: Mutex<Vec<HttpRequest>>,
-    }
-    impl ScriptedHttp {
-        fn new(routes: &[(&str, u16, &str)]) -> Self {
-            Self {
-                routes: routes
-                    .iter()
-                    .map(|(url, status, body)| ((*url).to_string(), (*status, (*body).to_string())))
-                    .collect(),
-                sent: Mutex::new(Vec::new()),
-            }
-        }
-    }
-    #[async_trait]
-    impl HttpPort for ScriptedHttp {
-        async fn send(&self, req: HttpRequest) -> Result<HttpResponse, PortError> {
-            let routed = self.routes.get(&req.url).cloned();
-            self.sent.lock().push(req);
-            match routed {
-                Some((status, body)) => Ok(HttpResponse {
-                    status,
-                    body: body.into_bytes(),
-                }),
-                None => Err(PortError::Io("unscripted url".into())),
-            }
-        }
-    }
-
-    /// A keychain stub returning a fixed (or absent) key for any entry name.
-    struct KeySecrets(Option<String>);
-    impl SecretStore for KeySecrets {
-        fn get(&self, _key: &str) -> Result<Option<String>, PortError> {
-            Ok(self.0.clone())
-        }
-        fn set(&self, _key: &str, _value: &str) -> Result<(), PortError> {
-            Ok(())
-        }
-        fn delete(&self, _key: &str) -> Result<(), PortError> {
-            Ok(())
-        }
-    }
-
-    struct FakeClock(i64);
-    impl Clock for FakeClock {
-        fn now(&self) -> Timestamp {
-            Timestamp(self.0)
-        }
-    }
-
     const FETCHED_AT: i64 = 1_700_000_000_000;
 
     fn strategy(key: Option<&str>, http: ScriptedHttp) -> AnthropicStrategy {
@@ -497,7 +369,7 @@ mod tests {
         );
     }
 
-    // ── parse_cost_report / spend_note ──────────────────────────────────────────
+    // ── parse_cost_report ───────────────────────────────────────────────────────
 
     #[test]
     fn parse_cost_report_sums_numeric_amounts_across_buckets() {
@@ -557,13 +429,6 @@ mod tests {
             (usd - 1.2345).abs() < 1e-9,
             "123.45 cents == $1.2345, got {usd}"
         );
-        assert_eq!(spend_note(usd), "API spend: $1.23 over the last 30 days.");
-    }
-
-    #[test]
-    fn spend_note_formats_two_decimals_of_usd() {
-        assert_eq!(spend_note(12.5), "API spend: $12.50 over the last 30 days.");
-        assert_eq!(spend_note(0.0), "API spend: $0.00 over the last 30 days.");
     }
 
     // ── fetch ────────────────────────────────────────────────────────────────────
@@ -592,10 +457,7 @@ mod tests {
             snap.windows.is_empty(),
             "spend has no quota, so no percentage bar"
         );
-        assert_eq!(
-            snap.note.as_deref(),
-            Some("API spend: $3.75 over the last 30 days.")
-        );
+        assert_eq!(snap.note, Some(UsageNote::ApiSpend { usd: 3.75 }));
         assert_eq!(snap.fetched_at, Timestamp(FETCHED_AT));
         // The single request is a GET to the cost endpoint carrying Anthropic's auth headers.
         let sent = http.sent.lock();
@@ -613,7 +475,7 @@ mod tests {
         let snap = strat.fetch(&ctx()).await.expect("403 is not an error");
         assert_eq!(snap.status, Status::Ok);
         assert!(snap.windows.is_empty(), "no invented zero window");
-        assert_eq!(snap.note.as_deref(), Some(LIMITATION_NOTE));
+        assert_eq!(snap.note, Some(UsageNote::OrgAdminKeyRequired));
         assert_eq!(snap.account, None);
     }
 

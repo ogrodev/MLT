@@ -1,4 +1,4 @@
-import type { SourceState, UsageErrorEvent, UsageSnapshot, UsageWindow } from './usage';
+import type { SourceState, UsageErrorEvent, UsageNote, UsageSnapshot, UsageWindow } from './usage';
 
 export type Tone = 'ok' | 'warn' | 'err' | 'idle';
 
@@ -25,15 +25,21 @@ export function sourceTabLabel(source: SourceState): string {
   return source.display_name;
 }
 
-export function reportsUsage(id: string): boolean {
-  return (
-    id === 'claude-code' ||
-    id === 'openrouter' ||
-    id === 'openai' ||
-    id === 'anthropic' ||
-    id.startsWith('codex:') ||
-    id.startsWith('claude-code:')
-  );
+export function reportsUsage(source: SourceState): boolean {
+  return source.reports_usage;
+}
+
+export function usageNoteText(note: UsageNote): string {
+  switch (note.kind) {
+    case 'api_spend':
+      return `API spend: $${note.usd.toFixed(2)} over the last 30 days.`;
+    case 'org_admin_key_required':
+      return "This key can't read organization usage — it needs an organization admin key, which individual accounts usually can't create.";
+    default: {
+      const exhaustive: never = note;
+      return exhaustive;
+    }
+  }
 }
 
 export function resetCountdown(resetsAt: number | null, now: number): string {
@@ -95,7 +101,7 @@ export function connectionState(
   error: string | null,
 ): { label: string; tone: Tone } {
   if (!selected) return { label: 'Not connected', tone: 'idle' };
-  if (!reportsUsage(selected.id)) return { label: 'Connected', tone: 'ok' };
+  if (!reportsUsage(selected)) return { label: 'Connected', tone: 'ok' };
   if (error) return snapshot ? { label: 'Stale', tone: 'warn' } : { label: 'Error', tone: 'err' };
   if (snapshot) return STATUS_CONN[snapshot.status];
   return { label: 'Connecting…', tone: 'idle' };

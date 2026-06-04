@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub mod anthropic;
 pub mod claude;
 pub mod codex;
+pub mod cost_provider;
 pub mod oauth;
 pub mod openai;
 pub mod openrouter;

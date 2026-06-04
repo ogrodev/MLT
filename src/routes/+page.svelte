@@ -28,6 +28,7 @@ import {
   sourceActive,
   sourceTabLabel,
   usageWindowKey,
+  usageNoteText,
   type Tone,
   type UsageRecords,
 } from '$lib/usageState';
@@ -119,7 +120,7 @@ function lastUpdated(ms: number): string {
 async function fetchConnectedUsage(discovered: SourceState[]): Promise<void> {
   await Promise.all(
     discovered
-      .filter((s) => sourceActive(s) && reportsUsage(s.id))
+      .filter((s) => sourceActive(s) && reportsUsage(s))
       .map((s) =>
         fetchUsage(s.id)
           .then((snap) => {
@@ -571,7 +572,7 @@ onMount(() => {
         </div>
       {/if}
 
-      {#if selected && !reportsUsage(selected.id)}
+      {#if selected && !reportsUsage(selected)}
         <div class="mt-8 text-center">
           <p class="text-sm text-neutral-700 dark:text-neutral-300">
             {selected.display_name} is connected
@@ -585,7 +586,7 @@ onMount(() => {
           <p
             class="mb-4 rounded-lg bg-neutral-100 px-3 py-2 text-[12px] leading-snug text-neutral-600 dark:bg-neutral-800/60 dark:text-neutral-300"
           >
-            {selSnap.note}
+            {usageNoteText(selSnap.note)}
           </p>
         {/if}
         <ul class="space-y-4">

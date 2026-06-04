@@ -677,7 +677,7 @@ mod tests {
     use mlt_core::ports::{
         ConsentStore, HttpPort, HttpRequest, HttpResponse, IdentityStore, PortError, SecretStore,
     };
-    use mlt_core::sources::{find_source, source_catalog};
+    use mlt_core::sources::{account_descriptor, find_source, source_catalog};
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -835,6 +835,25 @@ mod tests {
         assert_eq!(usage_route(&ProviderId::new("codex:")), None);
         assert_eq!(usage_route(&ProviderId::new("claude-code:")), None);
         assert_eq!(usage_route(&ProviderId::new("unknown:acct")), None);
+    }
+
+    #[test]
+    fn reports_usage_matches_the_usage_route() {
+        // The capability the frontend reads MUST track the backend's strategy dispatch exactly,
+        // so adding or removing a usage route can never silently drift from `reports_usage`.
+        for descriptor in source_catalog() {
+            assert_eq!(
+                descriptor.reports_usage,
+                usage_route(&descriptor.id).is_some(),
+                "{}",
+                descriptor.id.as_str()
+            );
+        }
+        // Account rows always have a usage route; the capability must agree for both bases.
+        let d = account_descriptor("codex", "acct").unwrap();
+        assert_eq!(d.reports_usage, usage_route(&d.id).is_some());
+        let d = account_descriptor("claude-code", "acct").unwrap();
+        assert_eq!(d.reports_usage, usage_route(&d.id).is_some());
     }
 
     #[tokio::test]

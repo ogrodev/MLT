@@ -14,6 +14,7 @@ import {
   sourceActive,
   sourceTabLabel,
   type UsageRecords,
+  usageNoteText,
   usageWindowKey,
 } from './usageState';
 
@@ -25,6 +26,7 @@ function source(overrides: Partial<SourceState>): SourceState {
     present: true,
     enabled: true,
     credential: 'LocalLogin',
+    reports_usage: true,
     label: null,
     account: null,
     ...overrides,
@@ -118,13 +120,9 @@ describe('usage state', () => {
     );
   });
 
-  it('matches backend usage routing and source activation rules', () => {
-    expect(reportsUsage('claude-code')).toBe(true);
-    expect(reportsUsage('codex:acct-1')).toBe(true);
-    expect(reportsUsage('claude-code:acct-2')).toBe(true);
-    expect(reportsUsage('openrouter')).toBe(true);
-    expect(reportsUsage('openai')).toBe(true);
-    expect(reportsUsage('anthropic')).toBe(true);
+  it('uses capability-driven usage reporting and source activation rules', () => {
+    expect(reportsUsage(source({ reports_usage: true }))).toBe(true);
+    expect(reportsUsage(source({ reports_usage: false }))).toBe(false);
 
     expect(sourceActive(source({ credential: 'LocalLogin', present: true, enabled: true }))).toBe(
       true,
@@ -134,6 +132,15 @@ describe('usage state', () => {
     );
     expect(sourceActive(source({ credential: 'ApiKey', present: false, enabled: true }))).toBe(
       true,
+    );
+  });
+
+  it('formats typed usage notes for display', () => {
+    expect(usageNoteText({ kind: 'api_spend', usd: 12.5 })).toBe(
+      'API spend: $12.50 over the last 30 days.',
+    );
+    expect(usageNoteText({ kind: 'org_admin_key_required' })).toBe(
+      "This key can't read organization usage — it needs an organization admin key, which individual accounts usually can't create.",
     );
   });
 

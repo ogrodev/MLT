@@ -86,6 +86,18 @@ impl AccountIdentity {
     }
 }
 
+/// An honest, machine-readable annotation about why a snapshot reads the way it does, for
+/// API-cost providers whose endpoint exposes spend with no quota (tasks 007/008). Core states
+/// the fact; the UI owns all user-facing wording. `None` is the usual windowed case.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UsageNote {
+    /// Real API spend over the trailing 30-day window, in USD dollars.
+    ApiSpend { usd: f64 },
+    /// The key authenticates but cannot read organization usage — it needs an org admin key.
+    OrgAdminKeyRequired,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageSnapshot {
     pub provider: ProviderId,
@@ -95,12 +107,13 @@ pub struct UsageSnapshot {
     /// Which account this snapshot reports, for display (email/org), or `None` when unknown.
     /// Provider-fetched, never user-entered; siloed per provider.
     pub account: Option<AccountIdentity>,
-    /// An honest, user-facing note about *why* usage reads the way it does — e.g. an API-cost
-    /// provider that cannot expose usage with the user's (non-admin) key (tasks 007/008). Shown
-    /// verbatim on the tile instead of inventing a misleading zero. `None` for the usual case.
-    /// `#[serde(default)]` so a snapshot serialized before this field existed still deserializes.
+    /// A typed, machine-readable annotation about *why* this snapshot reads the way it does
+    /// (e.g. an API-cost provider that exposes spend but no quota; tasks 007/008). Core states
+    /// the fact; the UI owns all user-facing wording — it never renders this verbatim. `None` is
+    /// the usual windowed case. `#[serde(default)]` so a snapshot serialized before this field
+    /// existed still deserializes.
     #[serde(default)]
-    pub note: Option<String>,
+    pub note: Option<UsageNote>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

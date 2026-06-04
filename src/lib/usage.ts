@@ -5,6 +5,7 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 // tauri-specta-generated bindings so the boundary is type-checked rather than hand-synced.
 export type WindowKind = 'Session' | 'Weekly' | 'Monthly' | 'Custom';
 export type Status = 'Ok' | 'Stale' | 'Error';
+export type UsageNote = { kind: 'api_spend'; usd: number } | { kind: 'org_admin_key_required' };
 
 export interface UsageWindow {
   kind: WindowKind;
@@ -28,9 +29,8 @@ export interface UsageSnapshot {
   fetched_at: number; // unix ms
   // Which account this snapshot reports (email/org), or null when unknown. Provider-fetched.
   account: AccountIdentity | null;
-  // An honest, user-facing note about why usage reads the way it does (e.g. an API-cost provider
-  // that can't expose usage with a non-admin key). Shown verbatim instead of a misleading zero.
-  note: string | null;
+  // Core states the fact; the UI owns wording.
+  note: UsageNote | null;
 }
 
 // A row of the connect/sources screen (mirrors mlt-core's `SourceState`). `present` is
@@ -47,6 +47,8 @@ export interface SourceState {
   present: boolean;
   enabled: boolean;
   credential: CredentialKind;
+  // Whether this source exposes usage we chart — the single source of truth; mirrors mlt-core `SourceState.reports_usage`.
+  reports_usage: boolean;
   // A user-assigned custom name (nickname/title), shown as the panel title, or null for none.
   label: string | null;
   // Provider-fetched account identity (email/org) for display, or null if not resolved yet.
