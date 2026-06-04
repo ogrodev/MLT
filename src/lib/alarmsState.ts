@@ -1,4 +1,4 @@
-import type { Alarm, AlarmPrefs, Recurrence, ThresholdConfig } from './alarms';
+import type { Alarm, AlarmPrefs, MissedPolicy, Recurrence, ThresholdConfig } from './alarms';
 import type { WindowKind } from './usage';
 
 export function describeRecurrence(r: Recurrence | null): string {
@@ -18,10 +18,9 @@ export function describeRecurrence(r: Recurrence | null): string {
   }
 }
 
-export function recurrenceFromForm(
-  mode: 'once' | 'daily' | 'weekly' | 'every_n',
-  everyNDays: number,
-): Recurrence | null {
+export type AlarmFormMode = 'once' | 'daily' | 'weekly' | 'every_n';
+
+export function recurrenceFromForm(mode: AlarmFormMode, everyNDays: number): Recurrence | null {
   switch (mode) {
     case 'once':
       return null;
@@ -36,6 +35,36 @@ export function recurrenceFromForm(
       return null;
     }
   }
+}
+
+export function recurrenceModeFor(recurrence: Recurrence | null): AlarmFormMode {
+  if (!recurrence) return 'once';
+
+  switch (recurrence.kind) {
+    case 'daily':
+      return 'daily';
+    case 'weekly':
+      return 'weekly';
+    case 'every_n_days':
+      return 'every_n';
+    default: {
+      recurrence satisfies never;
+      return 'once';
+    }
+  }
+}
+
+export function padDatePart(value: number): string {
+  return value.toString().padStart(2, '0');
+}
+
+export function toDatetimeLocal(ms: number): string {
+  const date = new Date(ms);
+  return `${date.getFullYear()}-${padDatePart(date.getMonth() + 1)}-${padDatePart(date.getDate())}T${padDatePart(date.getHours())}:${padDatePart(date.getMinutes())}`;
+}
+
+export function missedPolicyFromValue(value: string): MissedPolicy {
+  return value === 'coalesce' ? 'coalesce' : 'fire_each';
 }
 
 export function validateAlarmDraft(label: string, fireAt: number, now: number): string | null {
@@ -64,17 +93,30 @@ export function thresholdFor(
   prefs: AlarmPrefs,
   provider: string,
   window: WindowKind,
+  description: string | null,
 ): ThresholdConfig | null {
   return (
     prefs.thresholds.find(
-      (threshold) => threshold.provider === provider && threshold.window === window,
+      (threshold) =>
+        threshold.provider === provider &&
+        threshold.window === window &&
+        (threshold.window_description ?? null) === description,
     ) ?? null
   );
 }
 
-export function resetEnabledFor(prefs: AlarmPrefs, provider: string, window: WindowKind): boolean {
+export function resetEnabledFor(
+  prefs: AlarmPrefs,
+  provider: string,
+  window: WindowKind,
+  description: string | null,
+): boolean {
   return prefs.resets.some(
-    (reset) => reset.provider === provider && reset.window === window && reset.enabled === true,
+    (reset) =>
+      reset.provider === provider &&
+      reset.window === window &&
+      (reset.window_description ?? null) === description &&
+      reset.enabled,
   );
 }
 

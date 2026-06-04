@@ -717,7 +717,6 @@ pub fn run() {
                 clock,
                 notifier,
                 wake: Arc::new(tokio::sync::Notify::new()),
-                settings_lock: Arc::new(tokio::sync::Mutex::new(())),
                 seq: AtomicU64::new(0),
             });
             let notification_app = app.handle().clone();

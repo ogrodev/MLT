@@ -32,6 +32,10 @@ import {
 import {
   describeRecurrence,
   recurrenceFromForm,
+  recurrenceModeFor,
+  toDatetimeLocal,
+  missedPolicyFromValue,
+  type AlarmFormMode,
   validateAlarmDraft,
   sortAlarms,
   fireCountdown,
@@ -58,8 +62,6 @@ import {
   type Tone,
   type UsageRecords,
 } from '$lib/usageState';
-
-type AlarmFormMode = 'once' | 'daily' | 'weekly' | 'every_n';
 
 // Usage snapshot and last error keyed by provider id. Per-provider so each tile shows only its
 // own data: a failure (or stale data) for one provider never blanks or overwrites another's
@@ -255,32 +257,6 @@ async function saveName(source: SourceState): Promise<void> {
   }
 }
 
-function padDatePart(value: number): string {
-  return value.toString().padStart(2, '0');
-}
-
-function toDatetimeLocal(ms: number): string {
-  const date = new Date(ms);
-  return `${date.getFullYear()}-${padDatePart(date.getMonth() + 1)}-${padDatePart(date.getDate())}T${padDatePart(date.getHours())}:${padDatePart(date.getMinutes())}`;
-}
-
-function recurrenceModeFor(recurrence: Recurrence | null): AlarmFormMode {
-  if (!recurrence) return 'once';
-
-  switch (recurrence.kind) {
-    case 'daily':
-      return 'daily';
-    case 'weekly':
-      return 'weekly';
-    case 'every_n_days':
-      return 'every_n';
-    default: {
-      recurrence satisfies never;
-      return 'once';
-    }
-  }
-}
-
 function resetAlarmForm(): void {
   alarmLabel = '';
   alarmFireAtLocal = '';
@@ -330,40 +306,50 @@ async function removeAlarm(id: string): Promise<void> {
   }
 }
 
-function thresholdKey(provider: string, window: UsageWindow['kind']): string {
-  return `${provider}:${window}`;
+function thresholdKey(provider: string, w: UsageWindow): string {
+  return `${provider}:${w.kind}:${w.reset_description ?? ''}`;
 }
 
-function currentThreshold(provider: string, window: UsageWindow['kind']) {
-  return alarmPrefs ? thresholdFor(alarmPrefs, provider, window) : null;
+function currentThreshold(provider: string, w: UsageWindow) {
+  return alarmPrefs ? thresholdFor(alarmPrefs, provider, w.kind, w.reset_description) : null;
 }
 
-function thresholdLevelsText(provider: string, window: UsageWindow['kind']): string {
-  return formatLevels(currentThreshold(provider, window)?.levels ?? []);
+function thresholdLevelsText(provider: string, w: UsageWindow): string {
+  return formatLevels(currentThreshold(provider, w)?.levels ?? []);
 }
 
-function thresholdEnabled(provider: string, window: UsageWindow['kind']): boolean {
-  return currentThreshold(provider, window)?.enabled ?? false;
+function thresholdEnabled(provider: string, w: UsageWindow): boolean {
+  return currentThreshold(provider, w)?.enabled ?? false;
 }
 
-function thresholdDraftValue(provider: string, window: UsageWindow['kind']): string {
-  return thresholdDrafts[thresholdKey(provider, window)] ?? thresholdLevelsText(provider, window);
+function thresholdDraftValue(provider: string, w: UsageWindow): string {
+  return thresholdDrafts[thresholdKey(provider, w)] ?? thresholdLevelsText(provider, w);
 }
 
-function setThresholdDraft(provider: string, window: UsageWindow['kind'], value: string): void {
-  thresholdDrafts[thresholdKey(provider, window)] = value;
+function setThresholdDraft(provider: string, w: UsageWindow, value: string): void {
+  thresholdDrafts[thresholdKey(provider, w)] = value;
 }
 
 async function saveThresholdDraft(
   provider: string,
-  window: UsageWindow['kind'],
+  w: UsageWindow,
   value: string,
   enabled: boolean,
 ): Promise<void> {
-  setThresholdDraft(provider, window, value);
+  setThresholdDraft(provider, w, value);
   try {
-    alarmPrefs = await setThresholdAlert(provider, window, parseLevels(value), enabled);
-    setThresholdDraft(provider, window, thresholdLevelsText(provider, window));
+    alarmPrefs = await setThresholdAlert(
+      provider,
+      w.kind,
+      w.reset_description,
+      parseLevels(value),
+      enabled,
+    );
+    // Only normalize the field if the user hasn't typed something newer while the save was
+    // in flight — otherwise the post-save restore would clobber their in-progress edit.
+    if (thresholdDrafts[thresholdKey(provider, w)] === value) {
+      setThresholdDraft(provider, w, thresholdLevelsText(provider, w));
+    }
     alarmError = '';
   } catch (e) {
     alarmError = String(e);
@@ -372,11 +358,11 @@ async function saveThresholdDraft(
 
 async function saveResetNotification(
   provider: string,
-  window: UsageWindow['kind'],
+  w: UsageWindow,
   enabled: boolean,
 ): Promise<void> {
   try {
-    alarmPrefs = await setResetNotification(provider, window, enabled);
+    alarmPrefs = await setResetNotification(provider, w.kind, w.reset_description, enabled);
     alarmError = '';
   } catch (e) {
     alarmError = String(e);
@@ -385,10 +371,6 @@ async function saveResetNotification(
 
 function missedPolicyValue(): MissedPolicy {
   return alarmPrefs?.missed_policy ?? 'fire_each';
-}
-
-function missedPolicyFromValue(value: string): MissedPolicy {
-  return value === 'coalesce' ? 'coalesce' : 'fire_each';
 }
 
 async function saveMissedPolicy(policy: MissedPolicy): Promise<void> {
@@ -862,7 +844,7 @@ onMount(() => {
           {:else}
             <ul class="mt-3 space-y-3">
               {#each alertSources as source (source.id)}
-                {#each snapshots[source.id]?.windows ?? [] as w (w.kind)}
+                {#each snapshots[source.id]?.windows ?? [] as w, i (usageWindowKey(w, i))}
                   <li class="rounded-md bg-neutral-50 p-2 dark:bg-neutral-800/60">
                     <div class="flex items-baseline justify-between gap-2">
                       <span
@@ -877,17 +859,17 @@ onMount(() => {
                     <div class="mt-2 flex flex-wrap items-center gap-2">
                       <input
                         type="text"
-                        value={thresholdDraftValue(source.id, w.kind)}
+                        value={thresholdDraftValue(source.id, w)}
                         placeholder="80, 95"
                         aria-label="Threshold levels for {tabLabel(source)} {label(w)}"
                         onchange={(e) =>
                           saveThresholdDraft(
                             source.id,
-                            w.kind,
+                            w,
                             e.currentTarget.value,
-                            thresholdEnabled(source.id, w.kind),
+                            thresholdEnabled(source.id, w),
                           )}
-                        oninput={(e) => setThresholdDraft(source.id, w.kind, e.currentTarget.value)}
+                        oninput={(e) => setThresholdDraft(source.id, w, e.currentTarget.value)}
                         class="w-24 rounded-md border border-neutral-300 bg-white px-2 py-1 text-[12px] text-neutral-900 placeholder:text-neutral-400 focus:border-neutral-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-100"
                       />
                       <label
@@ -895,32 +877,34 @@ onMount(() => {
                       >
                         <input
                           type="checkbox"
-                          checked={thresholdEnabled(source.id, w.kind)}
+                          checked={thresholdEnabled(source.id, w)}
                           onchange={(e) =>
                             saveThresholdDraft(
                               source.id,
-                              w.kind,
-                              thresholdDraftValue(source.id, w.kind),
+                              w,
+                              thresholdDraftValue(source.id, w),
                               e.currentTarget.checked,
                             )}
                           class="h-3.5 w-3.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
                         />
                         Enabled
                       </label>
-                      <label
-                        class="flex items-center gap-1 text-[11px] text-neutral-600 dark:text-neutral-300"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={alarmPrefs
-                            ? resetEnabledFor(alarmPrefs, source.id, w.kind)
-                            : false}
-                          onchange={(e) =>
-                            saveResetNotification(source.id, w.kind, e.currentTarget.checked)}
-                          class="h-3.5 w-3.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
-                        />
-                        Reset notification
-                      </label>
+                      {#if w.resets_at !== null}
+                        <label
+                          class="flex items-center gap-1 text-[11px] text-neutral-600 dark:text-neutral-300"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={alarmPrefs
+                              ? resetEnabledFor(alarmPrefs, source.id, w.kind, w.reset_description)
+                              : false}
+                            onchange={(e) =>
+                              saveResetNotification(source.id, w, e.currentTarget.checked)}
+                            class="h-3.5 w-3.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                          />
+                          Reset notification
+                        </label>
+                      {/if}
                     </div>
                   </li>
                 {/each}

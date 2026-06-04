@@ -1,5 +1,5 @@
 //! The IO contracts. Adapters implement these; core only ever sees the traits.
-use crate::alarms::{Alarm, AlarmId, AlarmSettings};
+use crate::alarms::{Alarm, AlarmId, AlarmNotice, AlarmSettings, MissedPolicy, Reconciliation};
 use crate::domain::*;
 use async_trait::async_trait;
 
@@ -100,8 +100,30 @@ pub trait AlarmStore: Send + Sync {
     async fn alarms(&self) -> Result<Vec<Alarm>, PortError>;
     async fn upsert_alarm(&self, alarm: &Alarm) -> Result<(), PortError>;
     async fn delete_alarm(&self, id: &AlarmId) -> Result<(), PortError>;
+    /// Atomically reconcile due alarms (fire decision, advance recurring, complete one-offs)
+    /// and persist the result under the store's own lock, returning what came due so the caller
+    /// can notify *after* the write lands. Serialized against `upsert_alarm`/`delete_alarm`, so a
+    /// concurrent edit/delete can never interleave to resurrect an advanced alarm or be clobbered
+    /// mid-reconcile. Skips the write entirely when nothing is due.
+    async fn reconcile_due(
+        &self,
+        now: Timestamp,
+        policy: MissedPolicy,
+    ) -> Result<Reconciliation, PortError>;
     async fn settings(&self) -> Result<AlarmSettings, PortError>;
-    async fn save_settings(&self, settings: &AlarmSettings) -> Result<(), PortError>;
+    /// Atomic read-modify-write of settings under the store's own lock, returning the new
+    /// settings. Replaces get-then-clobber `save_settings` plus an external sentinel lock: the
+    /// store's lock now guards the data it owns, so settings writes are race-free without
+    /// callers coordinating.
+    async fn update_settings(
+        &self,
+        update: Box<dyn FnOnce(AlarmSettings) -> AlarmSettings + Send>,
+    ) -> Result<AlarmSettings, PortError>;
+    /// Atomically evaluate a usage snapshot against settings (threshold/reset rules), persist the
+    /// updated armed/reset state, and return the notices to deliver. Persisting before the caller
+    /// notifies means a crash drops a notification rather than re-firing it on next launch.
+    async fn evaluate_usage(&self, snapshot: &UsageSnapshot)
+        -> Result<Vec<AlarmNotice>, PortError>;
 }
 
 #[async_trait]

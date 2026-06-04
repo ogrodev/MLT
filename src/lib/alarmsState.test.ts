@@ -5,11 +5,14 @@ import {
   describeRecurrence,
   fireCountdown,
   formatLevels,
+  missedPolicyFromValue,
   parseLevels,
   recurrenceFromForm,
+  recurrenceModeFor,
   resetEnabledFor,
   sortAlarms,
   thresholdFor,
+  toDatetimeLocal,
   validateAlarmDraft,
 } from './alarmsState';
 
@@ -89,27 +92,28 @@ describe('alarm state', () => {
     const weekly = {
       provider: 'claude-code',
       window: 'Weekly' as const,
+      window_description: null,
       levels: [80, 95],
       enabled: true,
     };
     const settings = prefs({ thresholds: [weekly] });
 
-    expect(thresholdFor(settings, 'claude-code', 'Weekly')).toBe(weekly);
-    expect(thresholdFor(settings, 'codex', 'Weekly')).toBeNull();
-    expect(thresholdFor(settings, 'claude-code', 'Monthly')).toBeNull();
+    expect(thresholdFor(settings, 'claude-code', 'Weekly', null)).toBe(weekly);
+    expect(thresholdFor(settings, 'codex', 'Weekly', null)).toBeNull();
+    expect(thresholdFor(settings, 'claude-code', 'Monthly', null)).toBeNull();
   });
 
   it('defaults reset notifications off unless the matching pref is enabled', () => {
     const settings = prefs({
       resets: [
-        { provider: 'claude-code', window: 'Weekly', enabled: true },
-        { provider: 'claude-code', window: 'Monthly', enabled: false },
+        { provider: 'claude-code', window: 'Weekly', window_description: null, enabled: true },
+        { provider: 'claude-code', window: 'Monthly', window_description: null, enabled: false },
       ],
     });
 
-    expect(resetEnabledFor(settings, 'claude-code', 'Weekly')).toBe(true);
-    expect(resetEnabledFor(settings, 'claude-code', 'Monthly')).toBe(false);
-    expect(resetEnabledFor(settings, 'codex', 'Weekly')).toBe(false);
+    expect(resetEnabledFor(settings, 'claude-code', 'Weekly', null)).toBe(true);
+    expect(resetEnabledFor(settings, 'claude-code', 'Monthly', null)).toBe(false);
+    expect(resetEnabledFor(settings, 'codex', 'Weekly', null)).toBe(false);
   });
 
   it('formats threshold levels for display', () => {
@@ -121,5 +125,50 @@ describe('alarm state', () => {
     expect(parseLevels('95, 80, 80, 0, 200')).toEqual([80, 95]);
     expect(parseLevels('100\n1 nope 50')).toEqual([1, 50, 100]);
     expect(parseLevels('')).toEqual([]);
+  });
+
+  it('discriminates same-kind windows by description', () => {
+    const opus = {
+      provider: 'claude-code',
+      window: 'Custom' as const,
+      window_description: 'Opus · 7-day',
+      levels: [80],
+      enabled: true,
+    };
+    const sonnet = {
+      provider: 'claude-code',
+      window: 'Custom' as const,
+      window_description: 'Sonnet · 7-day',
+      levels: [90],
+      enabled: false,
+    };
+    const settings = prefs({ thresholds: [opus, sonnet] });
+
+    expect(thresholdFor(settings, 'claude-code', 'Custom', 'Opus · 7-day')).toBe(opus);
+    expect(thresholdFor(settings, 'claude-code', 'Custom', 'Sonnet · 7-day')).toBe(sonnet);
+    // A description matching neither must not collide onto the other Custom window.
+    expect(thresholdFor(settings, 'claude-code', 'Custom', null)).toBeNull();
+  });
+
+  it('maps a recurrence back to its form mode (inverse of recurrenceFromForm)', () => {
+    expect(recurrenceModeFor(null)).toBe('once');
+    expect(recurrenceModeFor({ kind: 'daily' })).toBe('daily');
+    expect(recurrenceModeFor({ kind: 'weekly' })).toBe('weekly');
+    expect(recurrenceModeFor({ kind: 'every_n_days', days: 3 })).toBe('every_n');
+    for (const mode of ['once', 'daily', 'weekly', 'every_n'] as const) {
+      expect(recurrenceModeFor(recurrenceFromForm(mode, 3))).toBe(mode);
+    }
+  });
+
+  it('formats a timestamp as a zero-padded local datetime-local string', () => {
+    // Built from local parts so the assertion is timezone-independent.
+    const local = new Date(2025, 0, 5, 9, 7);
+    expect(toDatetimeLocal(local.getTime())).toBe('2025-01-05T09:07');
+  });
+
+  it('maps select values to a missed policy, defaulting to fire_each', () => {
+    expect(missedPolicyFromValue('coalesce')).toBe('coalesce');
+    expect(missedPolicyFromValue('fire_each')).toBe('fire_each');
+    expect(missedPolicyFromValue('anything-else')).toBe('fire_each');
   });
 });

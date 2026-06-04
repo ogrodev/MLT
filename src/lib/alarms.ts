@@ -16,12 +16,14 @@ export interface Alarm {
 export interface ThresholdConfig {
   provider: string;
   window: WindowKind;
+  window_description: string | null;
   levels: number[];
   enabled: boolean;
 }
 export interface ResetPref {
   provider: string;
   window: WindowKind;
+  window_description: string | null;
   enabled: boolean;
 }
 export interface AlarmPrefs {
@@ -47,14 +49,18 @@ export const getAlarmPrefs = (): Promise<AlarmPrefs> => invoke('get_alarm_prefs'
 export const setThresholdAlert = (
   provider: string,
   window: WindowKind,
+  windowDescription: string | null,
   levels: number[],
   enabled: boolean,
-): Promise<AlarmPrefs> => invoke('set_threshold_alert', { provider, window, levels, enabled });
+): Promise<AlarmPrefs> =>
+  invoke('set_threshold_alert', { provider, window, windowDescription, levels, enabled });
 export const setResetNotification = (
   provider: string,
   window: WindowKind,
+  windowDescription: string | null,
   enabled: boolean,
-): Promise<AlarmPrefs> => invoke('set_reset_notification', { provider, window, enabled });
+): Promise<AlarmPrefs> =>
+  invoke('set_reset_notification', { provider, window, windowDescription, enabled });
 export const setMissedPolicy = (policy: MissedPolicy): Promise<AlarmPrefs> =>
   invoke('set_missed_policy', { policy });
 export const onAlarmsUpdated = (cb: (a: Alarm[]) => void): Promise<UnlistenFn> =>
