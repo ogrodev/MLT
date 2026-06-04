@@ -137,9 +137,13 @@ impl FetchStrategy for OpenAiStrategy {
             .ok_or(FetchError::Unavailable)?;
         let now = self.clock.now();
         let resp = self.http.send(bearer_get(&costs_url(now), &key)).await?;
-        let note = cost_provider::cost_note(resp.status, &resp.body, "OpenAI", |body| {
-            Ok(parse_costs(body)?.total_spend_usd)
-        })?;
+        let note = cost_provider::cost_note(
+            resp.status,
+            &resp.body,
+            "OpenAI",
+            cost_provider::OrgLimitation::UnauthorizedWithScopeMarker,
+            |body| Ok(parse_costs(body)?.total_spend_usd),
+        )?;
         Ok(UsageSnapshot {
             provider: ctx.provider.clone(),
             windows: Vec::new(),
@@ -363,21 +367,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_reports_the_org_usage_limitation_honestly_on_403() {
-        // The common non-admin key: it authenticates (validate_key passed) but can't read org
-        // usage. That is NOT an error and NOT a zero window — it's an honest note, Status::Ok.
+    async fn fetch_maps_a_geo_restricted_403_to_an_error() {
+        // OpenAI reserves the cost endpoint's 403 for a geo-restriction — a genuine upstream
+        // failure, NOT the org-admin-key limitation (that is the 401 + insufficient-permissions
+        // marker tested below). Treating it as the honest note would make a geo-blocked key look
+        // benignly "needs an admin key" with Status::Ok, masking the real failure.
         let url = costs_url(Timestamp(FETCHED_AT));
         let strat = strategy(
             Some("sk-scoped"),
             ScriptedHttp::new(&[(url.as_str(), 403, "")]),
         );
-        let snap = strat
-            .fetch(&ctx())
-            .await
-            .expect("403 is an honest note, not an error");
-        assert_eq!(snap.status, Status::Ok);
-        assert!(snap.windows.is_empty());
-        assert_eq!(snap.note, Some(UsageNote::OrgAdminKeyRequired));
+        assert!(matches!(
+            strat.fetch(&ctx()).await,
+            Err(FetchError::Upstream(_))
+        ));
     }
 
     #[tokio::test]

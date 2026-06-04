@@ -182,9 +182,13 @@ impl FetchStrategy for AnthropicStrategy {
             .http
             .send(anthropic_get(&cost_report_url(now), &key))
             .await?;
-        let note = cost_provider::cost_note(resp.status, &resp.body, "Anthropic", |body| {
-            Ok(parse_cost_report(body)?.total_spend_usd)
-        })?;
+        let note = cost_provider::cost_note(
+            resp.status,
+            &resp.body,
+            "Anthropic",
+            cost_provider::OrgLimitation::Forbidden,
+            |body| Ok(parse_cost_report(body)?.total_spend_usd),
+        )?;
         Ok(UsageSnapshot {
             provider: ctx.provider.clone(),
             // No quota means no honest percentage, so we render no window — the note carries the
