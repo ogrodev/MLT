@@ -29,6 +29,8 @@ export function reportsUsage(id: string): boolean {
   return (
     id === 'claude-code' ||
     id === 'openrouter' ||
+    id === 'openai' ||
+    id === 'anthropic' ||
     id.startsWith('codex:') ||
     id.startsWith('claude-code:')
   );

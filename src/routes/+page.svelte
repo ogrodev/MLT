@@ -581,6 +581,13 @@ onMount(() => {
           </p>
         </div>
       {:else if selSnap}
+        {#if selSnap.note}
+          <p
+            class="mb-4 rounded-lg bg-neutral-100 px-3 py-2 text-[12px] leading-snug text-neutral-600 dark:bg-neutral-800/60 dark:text-neutral-300"
+          >
+            {selSnap.note}
+          </p>
+        {/if}
         <ul class="space-y-4">
           {#each selSnap.windows as w, i (usageWindowKey(w, i))}
             <li>

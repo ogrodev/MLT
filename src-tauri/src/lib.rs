@@ -10,7 +10,6 @@ use mlt_core::domain::{ProviderId, UsageSnapshot};
 use mlt_core::ports::{
     ConsentStore, HttpPort, IdentityStore, SecretStore, SourceLabels, SourceProbe,
 };
-use mlt_core::providers::openrouter::validate_key;
 use mlt_core::providers::{FetchContext, FetchStrategy};
 use mlt_core::sources::{
     account_descriptor, account_source_id, active_sources, api_key_secret_key, discover_sources,
@@ -40,6 +39,8 @@ enum PopoverAction {
 enum UsageRoute<'a> {
     Claude,
     OpenRouter,
+    OpenAi,
+    Anthropic,
     Codex { account_id: &'a str },
     ClaudeAccount { account_id: &'a str },
 }
@@ -228,11 +229,30 @@ async fn apply_api_key(
     if descriptor.credential != CredentialKind::ApiKey {
         return Err("This source does not use an API key".into());
     }
-    validate_key(http, key).await.map_err(|e| e.to_string())?;
+    validate_api_key(id, http, key).await?;
     secrets
         .set(&api_key_secret_key(id), key.trim())
         .map_err(|e| e.to_string())?;
     consent.set_enabled(id, true).map_err(|e| e.to_string())
+}
+
+/// Validate a pasted API key against the correct provider before it is stored. Each API-key
+/// provider exposes its own `validate_key` (distinct endpoint, headers, and messages); routing by
+/// source id keeps a key from being checked against — or accepted by — the wrong provider. The
+/// returned `Err` carries that provider's own user-facing message.
+async fn validate_api_key(id: &ProviderId, http: &dyn HttpPort, key: &str) -> Result<(), String> {
+    match id.as_str() {
+        "openrouter" => mlt_core::providers::openrouter::validate_key(http, key)
+            .await
+            .map_err(|e| e.to_string()),
+        "openai" => mlt_core::providers::openai::validate_key(http, key)
+            .await
+            .map_err(|e| e.to_string()),
+        "anthropic" => mlt_core::providers::anthropic::validate_key(http, key)
+            .await
+            .map_err(|e| e.to_string()),
+        _ => Err("This source does not use an API key".into()),
+    }
 }
 
 /// Disconnect a source: purge every secret MLT cached for it under our *own* service, clear
@@ -407,6 +427,22 @@ async fn openrouter_usage() -> Result<UsageSnapshot, mlt_core::providers::FetchE
     strategy.fetch(&ctx).await
 }
 
+async fn openai_usage() -> Result<UsageSnapshot, mlt_core::providers::FetchError> {
+    let strategy = mlt_adapters::openai_strategy();
+    let ctx = FetchContext {
+        provider: ProviderId::new("openai"),
+    };
+    strategy.fetch(&ctx).await
+}
+
+async fn anthropic_usage() -> Result<UsageSnapshot, mlt_core::providers::FetchError> {
+    let strategy = mlt_adapters::anthropic_strategy();
+    let ctx = FetchContext {
+        provider: ProviderId::new("anthropic"),
+    };
+    strategy.fetch(&ctx).await
+}
+
 fn usage_route(id: &ProviderId) -> Option<UsageRoute<'_>> {
     let id = id.as_str();
     if id == "claude-code" {
@@ -414,6 +450,12 @@ fn usage_route(id: &ProviderId) -> Option<UsageRoute<'_>> {
     }
     if id == "openrouter" {
         return Some(UsageRoute::OpenRouter);
+    }
+    if id == "openai" {
+        return Some(UsageRoute::OpenAi);
+    }
+    if id == "anthropic" {
+        return Some(UsageRoute::Anthropic);
     }
     match id.split_once(':') {
         Some(("codex", account_id)) if !account_id.is_empty() => {
@@ -435,6 +477,8 @@ async fn fetch_for(
     match usage_route(id)? {
         UsageRoute::Claude => Some(claude_usage(identity).await),
         UsageRoute::OpenRouter => Some(openrouter_usage().await),
+        UsageRoute::OpenAi => Some(openai_usage().await),
+        UsageRoute::Anthropic => Some(anthropic_usage().await),
         UsageRoute::Codex { account_id } => Some(codex_usage(account_id, identity).await),
         UsageRoute::ClaudeAccount { account_id } => {
             Some(claude_account_usage(account_id, identity).await)
@@ -779,10 +823,47 @@ mod tests {
             usage_route(&ProviderId::new("openrouter")),
             Some(UsageRoute::OpenRouter)
         );
+        assert_eq!(
+            usage_route(&ProviderId::new("openai")),
+            Some(UsageRoute::OpenAi)
+        );
+        assert_eq!(
+            usage_route(&ProviderId::new("anthropic")),
+            Some(UsageRoute::Anthropic)
+        );
         assert_eq!(usage_route(&ProviderId::new("codex")), None);
         assert_eq!(usage_route(&ProviderId::new("codex:")), None);
         assert_eq!(usage_route(&ProviderId::new("claude-code:")), None);
         assert_eq!(usage_route(&ProviderId::new("unknown:acct")), None);
+    }
+
+    #[tokio::test]
+    async fn apply_api_key_routes_validation_per_provider() {
+        // The new API-key providers each validate through their own endpoint dispatch: a 200
+        // there connects and stores the key under that provider's namespaced entry; a 401 is
+        // rejected with nothing stored and the source left disconnected.
+        for id in ["openai", "anthropic"] {
+            let pid = ProviderId::new(id);
+
+            let secrets = MemSecrets::default();
+            let consent = FakeConsent::default();
+            apply_api_key(&secrets, &consent, &FakeHttp(Ok(200)), &pid, "  sk-good ")
+                .await
+                .expect("a valid key is accepted");
+            assert_eq!(
+                secrets.get(&format!("api_key.{id}")).unwrap().as_deref(),
+                Some("sk-good")
+            );
+            assert!(consent.is_enabled(&pid).unwrap());
+
+            let secrets = MemSecrets::default();
+            let consent = FakeConsent::default();
+            apply_api_key(&secrets, &consent, &FakeHttp(Ok(401)), &pid, "nope")
+                .await
+                .expect_err("a rejected key must not connect");
+            assert_eq!(secrets.get(&format!("api_key.{id}")).unwrap(), None);
+            assert!(!consent.is_enabled(&pid).unwrap());
+        }
     }
     #[tokio::test]
     async fn apply_api_key_stores_and_connects_a_valid_key() {

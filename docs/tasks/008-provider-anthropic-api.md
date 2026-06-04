@@ -2,7 +2,7 @@
 
 > Connect my Anthropic API key and see usage — or an honest note when a solo key can't expose it.
 
-**Capability:** [§3 Provider coverage](../PRD.md#3-provider-coverage) · **Status:** ◻ not started · **Depends on:** 003
+**Capability:** [§3 Provider coverage](../PRD.md#3-provider-coverage) · **Status:** 🟡 partial · **Depends on:** 003
 
 ## User story
 As an Anthropic API user, I want my usage shown when possible, and a truthful explanation
@@ -17,11 +17,11 @@ when my key can't access it, so the app never shows a misleading number.
 ## Acceptance criteria
 - [ ] When usage **is** retrievable, the Anthropic API tile shows normalized windows with
       **percent used** and reset info per §2, auto-refreshing with the rest.
-- [ ] When usage **cannot** be exposed with the user's key, the tile states this **honestly**
+- [x] When usage **cannot** be exposed with the user's key, the tile states this **honestly**
       — **not zero or a misleading value**.
-- [ ] Fetch failure shows a **stale/error** state and retains last known values; other
+- [x] Fetch failure shows a **stale/error** state and retains last known values; other
       providers are unaffected.
-- [ ] The Anthropic **API** tile is clearly distinct from the Claude Code **subscription**
+- [x] The Anthropic **API** tile is clearly distinct from the Claude Code **subscription**
       tile, and data stays **siloed**.
 
 ## Done

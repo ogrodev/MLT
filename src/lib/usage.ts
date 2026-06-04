@@ -28,6 +28,9 @@ export interface UsageSnapshot {
   fetched_at: number; // unix ms
   // Which account this snapshot reports (email/org), or null when unknown. Provider-fetched.
   account: AccountIdentity | null;
+  // An honest, user-facing note about why usage reads the way it does (e.g. an API-cost provider
+  // that can't expose usage with a non-admin key). Shown verbatim instead of a misleading zero.
+  note: string | null;
 }
 
 // A row of the connect/sources screen (mirrors mlt-core's `SourceState`). `present` is

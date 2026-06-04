@@ -231,6 +231,7 @@ impl FetchStrategy for OpenRouterStrategy {
             status: Status::Ok,
             fetched_at: self.clock.now(),
             account: None,
+            note: None,
         })
     }
 

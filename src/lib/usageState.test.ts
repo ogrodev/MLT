@@ -46,6 +46,7 @@ function snapshot(provider: string, email: string | null): UsageSnapshot {
     status: 'Ok',
     fetched_at: 1_700_000_000_000,
     account: email ? { email, organization: null } : null,
+    note: null,
   };
 }
 
@@ -122,6 +123,8 @@ describe('usage state', () => {
     expect(reportsUsage('codex:acct-1')).toBe(true);
     expect(reportsUsage('claude-code:acct-2')).toBe(true);
     expect(reportsUsage('openrouter')).toBe(true);
+    expect(reportsUsage('openai')).toBe(true);
+    expect(reportsUsage('anthropic')).toBe(true);
 
     expect(sourceActive(source({ credential: 'LocalLogin', present: true, enabled: true }))).toBe(
       true,

@@ -95,6 +95,12 @@ pub struct UsageSnapshot {
     /// Which account this snapshot reports, for display (email/org), or `None` when unknown.
     /// Provider-fetched, never user-entered; siloed per provider.
     pub account: Option<AccountIdentity>,
+    /// An honest, user-facing note about *why* usage reads the way it does — e.g. an API-cost
+    /// provider that cannot expose usage with the user's (non-admin) key (tasks 007/008). Shown
+    /// verbatim on the tile instead of inventing a misleading zero. `None` for the usual case.
+    /// `#[serde(default)]` so a snapshot serialized before this field existed still deserializes.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
