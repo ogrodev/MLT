@@ -103,13 +103,20 @@ pub struct Costs {
 /// One USD amount, however `/v1/organization/costs` spells it: the real shape is an
 /// `{ "value": <number>, "currency": "usd" }` object, but we also accept a bare JSON number or a
 /// numeric string. Anything else — absent, null, non-numeric — reads as `0.0` (ADR 0015 lossy
-/// decoding): a garbled amount is dropped from the sum, never fatal.
+/// decoding): a garbled or non-finite amount is dropped from the sum, never fatal.
 fn amount_usd(amount: &serde_json::Value) -> f64 {
-    match amount {
+    let value = match amount {
         serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
         serde_json::Value::String(s) => s.trim().parse::<f64>().unwrap_or(0.0),
         serde_json::Value::Object(_) => amount.get("value").map_or(0.0, amount_usd),
         _ => 0.0,
+    };
+    // A numeric string can parse to a non-finite f64 ("NaN", "inf"); flatten it to 0.0 so it can
+    // never poison the sum or the user-facing note (ADR 0015 lossy decoding; matches Anthropic).
+    if value.is_finite() {
+        value
+    } else {
+        0.0
     }
 }
 
@@ -489,6 +496,28 @@ mod tests {
     #[test]
     fn parse_costs_rejects_non_json() {
         assert!(parse_costs("not json").is_err());
+    }
+
+    #[test]
+    fn parse_costs_drops_non_finite_string_amounts() {
+        // A numeric string like "NaN"/"inf" parses to a non-finite f64; it must be dropped (0.0),
+        // never propagated into the total or a "$NaN"/"$inf" note. Only the real 4.00 counts.
+        let body = r#"{"data":[{"results":[
+            {"amount":{"value":"NaN"}},
+            {"amount":{"value":"inf"}},
+            {"amount":{"value":"-inf"}},
+            {"amount":{"value":4.00,"currency":"usd"}}
+        ]}]}"#;
+        let costs = parse_costs(body).unwrap();
+        assert!(
+            costs.total_spend_usd.is_finite(),
+            "non-finite amounts must not propagate"
+        );
+        assert_eq!(costs.total_spend_usd, 4.00);
+        assert_eq!(
+            spend_note(costs.total_spend_usd),
+            "API spend: $4.00 over the last 30 days."
+        );
     }
 
     #[test]

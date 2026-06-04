@@ -23,7 +23,7 @@
 //! All HTTP IO is injected via [`HttpPort`] and the key is read via [`SecretStore`], so the
 //! parsing/decision logic is pure and unit-tested against fakes — no live account is touched in
 //! `cargo test` (a live check is the hand-run `anthropic_live` example).
-use crate::domain::{Status, UsageSnapshot};
+use crate::domain::{Status, Timestamp, UsageSnapshot};
 use crate::ports::{Clock, HttpPort, HttpRequest, SecretStore};
 use crate::sources::api_key_secret_key;
 use async_trait::async_trait;
@@ -35,11 +35,39 @@ use super::{FetchContext, FetchError, FetchKind, FetchStrategy};
 /// key works without needing org scope, so it is the cheapest call for [`validate_key`].
 pub const MODELS_URL: &str = "https://api.anthropic.com/v1/models";
 
-/// Anthropic's org **cost** endpoint, read by [`AnthropicStrategy`]. The URL is static — a `1d`
-/// bucket is capped at 31 buckets, so `limit=31` fixes a rolling ~30-day window with no dynamic
-/// `start` parameter (PROVIDERS.md §"Anthropic API"). Reports USD spend with no quota attached.
-pub const COST_REPORT_URL: &str =
-    "https://api.anthropic.com/v1/organizations/cost_report?bucket_width=1d&limit=31";
+/// The base of Anthropic's org **cost** endpoint, read by [`AnthropicStrategy`]; [`cost_report_url`]
+/// appends the query. Reports USD spend (sent in cents) with no quota attached.
+const COST_REPORT_BASE: &str = "https://api.anthropic.com/v1/organizations/cost_report";
+
+/// Build the cost-report URL for a rolling ~30-day window ending at `now`. `starting_at` is sent as
+/// an RFC 3339 UTC day boundary 30 days back: the docs list it as a (non-optional) query parameter
+/// while the published example omits it, so we send it — correct either way, it pins the window
+/// explicitly and satisfies the documented contract (avoiding a possible 400 on the admin happy
+/// path). `bucket_width=1d` with `limit=31` caps the daily buckets (PROVIDERS.md §"Anthropic API").
+/// Docs: https://platform.claude.com/docs/en/api/admin/cost_report.
+pub fn cost_report_url(now: Timestamp) -> String {
+    const THIRTY_DAYS_MS: i64 = 30 * 86_400_000;
+    let starting_at = day_start_rfc3339(Timestamp(now.0 - THIRTY_DAYS_MS));
+    format!("{COST_REPORT_BASE}?starting_at={starting_at}&bucket_width=1d&limit=31")
+}
+
+/// Format `ts` as RFC 3339 at the start of its UTC day (`YYYY-MM-DDT00:00:00Z`), via Howard
+/// Hinnant's `civil_from_days` — pure integer arithmetic, so core needs no clock or calendar crate
+/// (purity gate). `div_euclid` floors toward negative infinity, keeping pre-epoch instants sound.
+fn day_start_rfc3339(ts: Timestamp) -> String {
+    let days = ts.0.div_euclid(86_400_000);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}-{month:02}-{day:02}T00:00:00Z")
+}
 
 /// The honest note shown when the key authenticates but cannot read org usage (a 403 at the cost
 /// endpoint). Shown verbatim on the tile instead of a misleading number (task 008 AC).
@@ -91,7 +119,7 @@ pub async fn validate_key(http: &dyn HttpPort, key: &str) -> Result<(), ApiKeyEr
 
 // ── Usage reading (task 008) ───────────────────────────────────────────────────
 
-/// The org spend read from [`COST_REPORT_URL`], summed across every daily bucket. Lossy
+/// The org spend read from [`cost_report_url`], summed across every daily bucket. Lossy
 /// (ADR 0015): a missing or garbled amount reads as 0.0 rather than failing the whole snapshot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CostReport {
@@ -99,7 +127,7 @@ pub struct CostReport {
     pub total_spend_usd: f64,
 }
 
-/// Coerce one JSON amount to USD, tolerating the shapes the cost report can emit: a bare number,
+/// Coerce one JSON amount to a number (the cost report's lowest currency units — cents),
 /// a numeric string (`"12.34"`, as Anthropic sends), or an `{ "value": <number> }` wrapper (as
 /// the sibling OpenAI cost report sends). Anything else — null, a non-numeric string, an odd
 /// object — reads as 0.0, and a non-finite result is flattened to 0.0 so it can never poison the
@@ -127,11 +155,14 @@ fn result_amount(result: &serde_json::Value) -> f64 {
 /// Parse the org cost report. Bad JSON is fatal (an upstream error); everything below that is
 /// lossy — a missing `data`/`results` array, an absent or garbled amount, all read as 0.0, never
 /// an error (ADR 0015). The report nests daily buckets under `data`, each with a `results` array
-/// of USD amounts; we sum every amount across them.
+/// of cent amounts; we sum them, then convert once to USD dollars (see the units note below).
 pub fn parse_cost_report(body: &str) -> Result<CostReport, FetchError> {
     let value: serde_json::Value =
         serde_json::from_str(body).map_err(|e| FetchError::Upstream(format!("bad json: {e}")))?;
-    let total_spend_usd: f64 = value
+    // Anthropic reports each `amount` in the currency's lowest units — cents — as a decimal
+    // string (e.g. "123.45" USD == $1.2345), so the bucket sum is in cents; convert to dollars
+    // once here. Docs: https://platform.claude.com/docs/en/api/admin/cost_report.
+    let total_cents: f64 = value
         .get("data")
         .and_then(serde_json::Value::as_array)
         .into_iter()
@@ -140,7 +171,9 @@ pub fn parse_cost_report(body: &str) -> Result<CostReport, FetchError> {
         .flatten()
         .map(result_amount)
         .sum();
-    Ok(CostReport { total_spend_usd })
+    Ok(CostReport {
+        total_spend_usd: total_cents / 100.0,
+    })
 }
 
 /// The honest, user-facing note for a successful cost read: the **real** USD spend as text, never
@@ -192,7 +225,11 @@ impl FetchStrategy for AnthropicStrategy {
 
     async fn fetch(&self, ctx: &FetchContext) -> Result<UsageSnapshot, FetchError> {
         let key = self.api_key(ctx).ok_or(FetchError::Unavailable)?;
-        let resp = self.http.send(anthropic_get(COST_REPORT_URL, &key)).await?;
+        let now = self.clock.now();
+        let resp = self
+            .http
+            .send(anthropic_get(&cost_report_url(now), &key))
+            .await?;
         let note = match resp.status {
             200 => {
                 let report = parse_cost_report(&String::from_utf8_lossy(&resp.body))?;
@@ -217,7 +254,7 @@ impl FetchStrategy for AnthropicStrategy {
             // truth (real spend, or the limitation) instead of a misleading 0% bar (task 008 AC).
             windows: Vec::new(),
             status: Status::Ok,
-            fetched_at: self.clock.now(),
+            fetched_at: now,
             account: None,
             note: Some(note),
         })
@@ -443,15 +480,33 @@ mod tests {
         }
     }
 
+    /// The cost-report URL the strategy builds for the test clock — used to script the route and
+    /// assert exactly what hits the wire.
+    fn cost_url() -> String {
+        cost_report_url(Timestamp(FETCHED_AT))
+    }
+
+    #[test]
+    fn cost_report_url_sends_a_30_day_starting_at_day_boundary() {
+        // starting_at is a UTC day boundary 30 days before `now` (the docs list it as a required
+        // query param; the example omits it — sending it is correct either way). 2023-11-14 − 30d
+        // = 2023-10-15.
+        assert_eq!(
+            cost_report_url(Timestamp(FETCHED_AT)),
+            "https://api.anthropic.com/v1/organizations/cost_report?starting_at=2023-10-15T00:00:00Z&bucket_width=1d&limit=31"
+        );
+    }
+
     // ── parse_cost_report / spend_note ──────────────────────────────────────────
 
     #[test]
     fn parse_cost_report_sums_numeric_amounts_across_buckets() {
-        // A `data` array of daily buckets, each with a `results` array of USD amounts.
+        // A `data` array of daily buckets, each with a `results` array of cent amounts (Anthropic's
+        // lowest-currency-unit strings); the parser sums cents and divides by 100 to get dollars.
         let body = r#"{
             "data": [
-                { "results": [ { "amount": 1.5 }, { "amount": 0.5 } ] },
-                { "results": [ { "amount": 2.0 } ] }
+                { "results": [ { "amount": 150.0 }, { "amount": 50.0 } ] },
+                { "results": [ { "amount": 200.0 } ] }
             ]
         }"#;
         assert_eq!(parse_cost_report(body).unwrap().total_spend_usd, 4.0);
@@ -460,11 +515,11 @@ mod tests {
     #[test]
     fn parse_cost_report_tolerates_string_and_object_amounts() {
         // Anthropic emits the amount as a numeric string; the sibling OpenAI report wraps it as
-        // `{ "value": .. }`. Both coerce to the same number (ADR 0015 lossy decoding).
+        // `{ "value": .. }`. Both shapes are accepted (ADR 0015), summed as cents, converted to USD.
         let body = r#"{
             "data": [
-                { "results": [ { "amount": "1.50" } ] },
-                { "results": [ { "amount": { "value": 2.25 } } ] }
+                { "results": [ { "amount": "150.00" } ] },
+                { "results": [ { "amount": { "value": 225.0 } } ] }
             ]
         }"#;
         assert_eq!(parse_cost_report(body).unwrap().total_spend_usd, 3.75);
@@ -479,7 +534,7 @@ mod tests {
                 { "results": [ { "amount": "not-a-number" }, { } ] },
                 { "results": [ { "amount": null } ] },
                 { },
-                { "results": [ { "amount": 3.0 } ] }
+                { "results": [ { "amount": 300.0 } ] }
             ]
         }"#;
         assert_eq!(parse_cost_report(body).unwrap().total_spend_usd, 3.0);
@@ -493,6 +548,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_cost_report_reads_amounts_as_cents_not_dollars() {
+        // Anthropic sends `amount` in cents (docs: "123.45" USD == $1.23), so the parser divides
+        // by 100. A regression to treating it as dollars silently inflates spend 100x.
+        let body = r#"{ "data": [ { "results": [ { "amount": "123.45" } ] } ] }"#;
+        let usd = parse_cost_report(body).unwrap().total_spend_usd;
+        assert!(
+            (usd - 1.2345).abs() < 1e-9,
+            "123.45 cents == $1.2345, got {usd}"
+        );
+        assert_eq!(spend_note(usd), "API spend: $1.23 over the last 30 days.");
+    }
+
+    #[test]
     fn spend_note_formats_two_decimals_of_usd() {
         assert_eq!(spend_note(12.5), "API spend: $12.50 over the last 30 days.");
         assert_eq!(spend_note(0.0), "API spend: $0.00 over the last 30 days.");
@@ -502,8 +570,9 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_reports_real_spend_as_an_honest_note() {
-        let body = r#"{"data":[{"results":[{"amount":"2.50"}]},{"results":[{"amount":"1.25"}]}]}"#;
-        let http = Arc::new(ScriptedHttp::new(&[(COST_REPORT_URL, 200, body)]));
+        let body =
+            r#"{"data":[{"results":[{"amount":"250.00"}]},{"results":[{"amount":"125.00"}]}]}"#;
+        let http = Arc::new(ScriptedHttp::new(&[(&cost_url(), 200, body)]));
         let strat = AnthropicStrategy {
             secrets: Arc::new(KeySecrets(Some("sk-ant-api-good".into()))),
             http: http.clone(),
@@ -532,7 +601,7 @@ mod tests {
         let sent = http.sent.lock();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].method, "GET");
-        assert_eq!(sent[0].url, COST_REPORT_URL);
+        assert_eq!(sent[0].url, cost_url());
         assert!(has_header(&sent[0], "x-api-key", "sk-ant-api-good"));
         assert!(has_header(&sent[0], "anthropic-version", "2023-06-01"));
     }
@@ -540,7 +609,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_states_the_limitation_honestly_on_403() {
         // A 403 is the honest limitation — a non-admin key — NOT an error and NOT a 0% window.
-        let strat = strategy(Some("k"), ScriptedHttp::new(&[(COST_REPORT_URL, 403, "")]));
+        let strat = strategy(Some("k"), ScriptedHttp::new(&[(&cost_url(), 403, "")]));
         let snap = strat.fetch(&ctx()).await.expect("403 is not an error");
         assert_eq!(snap.status, Status::Ok);
         assert!(snap.windows.is_empty(), "no invented zero window");
@@ -553,7 +622,7 @@ mod tests {
         // 401 ≠ 403: the key authenticated at validation but is now refused — a real error.
         let strat = strategy(
             Some("sk-ant-api-bad"),
-            ScriptedHttp::new(&[(COST_REPORT_URL, 401, "")]),
+            ScriptedHttp::new(&[(&cost_url(), 401, "")]),
         );
         assert!(matches!(
             strat.fetch(&ctx()).await,
@@ -563,7 +632,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_maps_a_rate_limit() {
-        let strat = strategy(Some("k"), ScriptedHttp::new(&[(COST_REPORT_URL, 429, "")]));
+        let strat = strategy(Some("k"), ScriptedHttp::new(&[(&cost_url(), 429, "")]));
         assert!(matches!(
             strat.fetch(&ctx()).await,
             Err(FetchError::RateLimited)
@@ -572,7 +641,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_maps_a_server_error_to_upstream() {
-        let strat = strategy(Some("k"), ScriptedHttp::new(&[(COST_REPORT_URL, 500, "")]));
+        let strat = strategy(Some("k"), ScriptedHttp::new(&[(&cost_url(), 500, "")]));
         assert!(matches!(
             strat.fetch(&ctx()).await,
             Err(FetchError::Upstream(_))
