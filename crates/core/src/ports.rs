@@ -1,4 +1,5 @@
 //! The IO contracts. Adapters implement these; core only ever sees the traits.
+use crate::alarms::{Alarm, AlarmId, AlarmSettings};
 use crate::domain::*;
 use async_trait::async_trait;
 
@@ -91,6 +92,16 @@ pub trait IdentityStore: Send + Sync {
 pub trait UsageRepo: Send + Sync {
     async fn save(&self, snapshot: &UsageSnapshot) -> Result<(), PortError>;
     async fn latest(&self, provider: &ProviderId) -> Result<Option<UsageSnapshot>, PortError>;
+}
+
+/// Persists user alarms + alarm settings/state. Plain settings (NOT secrets, NOT keychain).
+#[async_trait]
+pub trait AlarmStore: Send + Sync {
+    async fn alarms(&self) -> Result<Vec<Alarm>, PortError>;
+    async fn upsert_alarm(&self, alarm: &Alarm) -> Result<(), PortError>;
+    async fn delete_alarm(&self, id: &AlarmId) -> Result<(), PortError>;
+    async fn settings(&self) -> Result<AlarmSettings, PortError>;
+    async fn save_settings(&self, settings: &AlarmSettings) -> Result<(), PortError>;
 }
 
 #[async_trait]

@@ -5,11 +5,13 @@
 //! Tauri app wires them together. This is what makes the logic testable in milliseconds
 //! with fakes and keeps OS-specific code out of the core. See `docs/adr/0006-hexagonal-core.md`.
 
+pub mod alarms;
 pub mod domain;
 pub mod ports;
 pub mod providers;
 pub mod sources;
 
+pub use alarms::*;
 pub use domain::*;
 pub use ports::*;
 pub use providers::*;
