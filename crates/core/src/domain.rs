@@ -86,6 +86,18 @@ impl AccountIdentity {
     }
 }
 
+/// An honest, machine-readable annotation about why a snapshot reads the way it does, for
+/// API-cost providers whose endpoint exposes spend with no quota (tasks 007/008). Core states
+/// the fact; the UI owns all user-facing wording. `None` is the usual windowed case.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UsageNote {
+    /// Real API spend over the trailing 30-day window, in USD dollars.
+    ApiSpend { usd: f64 },
+    /// The key authenticates but cannot read organization usage — it needs an org admin key.
+    OrgAdminKeyRequired,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageSnapshot {
     pub provider: ProviderId,
@@ -95,6 +107,13 @@ pub struct UsageSnapshot {
     /// Which account this snapshot reports, for display (email/org), or `None` when unknown.
     /// Provider-fetched, never user-entered; siloed per provider.
     pub account: Option<AccountIdentity>,
+    /// A typed, machine-readable annotation about *why* this snapshot reads the way it does
+    /// (e.g. an API-cost provider that exposes spend but no quota; tasks 007/008). Core states
+    /// the fact; the UI owns all user-facing wording — it never renders this verbatim. `None` is
+    /// the usual windowed case. `#[serde(default)]` so a snapshot serialized before this field
+    /// existed still deserializes.
+    #[serde(default)]
+    pub note: Option<UsageNote>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -140,5 +159,39 @@ mod tests {
             ..w
         };
         assert_eq!(over.remaining_percent(), 0.0);
+    }
+
+    #[test]
+    fn usage_note_serializes_to_the_tagged_wire_shape_the_frontend_expects() {
+        // The popover's only honesty surface (tasks 007/008) is hand-synced with this exact wire
+        // shape in src/lib/usage.ts. Pin it so a Rust-side variant rename or a dropped `rename_all`
+        // fails CI here — before it reaches the frontend, whose exhaustive switch only catches an
+        // *added* variant, never a renamed `kind` (which would silently render as garbage).
+        assert_eq!(
+            serde_json::to_value(UsageNote::ApiSpend { usd: 12.5 }).unwrap(),
+            serde_json::json!({ "kind": "api_spend", "usd": 12.5 })
+        );
+        assert_eq!(
+            serde_json::to_value(UsageNote::OrgAdminKeyRequired).unwrap(),
+            serde_json::json!({ "kind": "org_admin_key_required" })
+        );
+    }
+
+    #[test]
+    fn usage_snapshot_deserializes_without_a_note_field() {
+        // `#[serde(default)]` on `note` keeps a snapshot serialized before the field existed (or
+        // any payload that omits it) deserializing cleanly to `note: None`, never erroring.
+        let mut value = serde_json::to_value(UsageSnapshot {
+            provider: ProviderId::new("openai"),
+            windows: Vec::new(),
+            status: Status::Ok,
+            fetched_at: Timestamp(1_700_000_000_000),
+            account: None,
+            note: Some(UsageNote::ApiSpend { usd: 1.0 }),
+        })
+        .unwrap();
+        value.as_object_mut().unwrap().remove("note");
+        let snap: UsageSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(snap.note, None);
     }
 }

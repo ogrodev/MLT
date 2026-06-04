@@ -245,6 +245,7 @@ impl FetchStrategy for ClaudeCodeStrategy {
                     status: Status::Ok,
                     fetched_at: self.clock.now(),
                     account,
+                    note: None,
                 })
             }
             429 => Err(FetchError::RateLimited),

@@ -41,6 +41,9 @@ pub struct SourceDescriptor {
     /// ever reads (ADR 0012). API-key sources leave this `None`: their secret is the
     /// user-entered key at [`api_key_secret_key`].
     pub oauth_cache_key: Option<String>,
+    /// Whether this source exposes usage we fetch and chart — the single source of truth the
+    /// frontend reads instead of hardcoding ids. Must agree with the backend usage route.
+    pub reports_usage: bool,
 }
 
 impl SourceDescriptor {
@@ -56,6 +59,7 @@ impl SourceDescriptor {
             credential: self.credential,
             label: None,
             account: None,
+            reports_usage: self.reports_usage,
         }
     }
 
@@ -97,6 +101,10 @@ pub struct SourceState {
     /// The provider-fetched account identity (email/org) for display, or `None` when not yet
     /// resolved. Cached via the identity store and siloed per source; never user-entered.
     pub account: Option<AccountIdentity>,
+    /// Whether this source exposes usage we fetch and chart — the single source of truth the
+    /// frontend reads instead of hardcoding ids. Serialized to the popover; must agree with
+    /// the backend usage route.
+    pub reports_usage: bool,
 }
 
 impl SourceState {
@@ -127,6 +135,7 @@ pub fn source_catalog() -> Vec<SourceDescriptor> {
             // Our refreshed-OAuth copy lives here; disconnect purges it. Never Claude Code's
             // own keychain item, which we only read.
             oauth_cache_key: Some(crate::providers::claude::CACHE_KEY.to_string()),
+            reports_usage: true,
         },
         SourceDescriptor {
             id: ProviderId::new("openrouter"),
@@ -137,6 +146,34 @@ pub fn source_catalog() -> Vec<SourceDescriptor> {
                           is sent only to OpenRouter.",
             credential: CredentialKind::ApiKey,
             oauth_cache_key: None,
+            reports_usage: true,
+        },
+        SourceDescriptor {
+            id: ProviderId::new("openai"),
+            display_name: "OpenAI API",
+            access_note: "Uses an OpenAI API key you paste in to read your API usage and \
+                          spend. The key is stored only in your OS keychain — never shown \
+                          again in full, never written to MLT's database or logs — and is \
+                          sent only to OpenAI. Reading usage needs an organization admin key; \
+                          with a personal key the tile says so honestly rather than showing a \
+                          misleading zero.",
+            credential: CredentialKind::ApiKey,
+            oauth_cache_key: None,
+            reports_usage: true,
+        },
+        SourceDescriptor {
+            id: ProviderId::new("anthropic"),
+            display_name: "Anthropic API",
+            access_note: "Uses an Anthropic API key you paste in to read your API usage and \
+                          spend — this is the Anthropic API provider, separate from Claude \
+                          Code. The key is stored only in your OS keychain — never shown again \
+                          in full, never written to MLT's database or logs — and is sent only \
+                          to Anthropic. Reading usage needs an organization admin key; with a \
+                          personal key the tile says so honestly rather than showing a \
+                          misleading zero.",
+            credential: CredentialKind::ApiKey,
+            oauth_cache_key: None,
+            reports_usage: true,
         },
     ]
 }
@@ -164,6 +201,7 @@ struct AccountProviderSpec {
     base: &'static str,
     display_name: &'static str,
     access_note: &'static str,
+    reports_usage: bool,
 }
 
 /// Honest, per-base disclosures shown before opt-in. Identical across a provider's accounts; the
@@ -184,11 +222,13 @@ const ACCOUNT_PROVIDERS: &[AccountProviderSpec] = &[
         base: "codex",
         display_name: "Codex",
         access_note: CODEX_ACCESS_NOTE,
+        reports_usage: true,
     },
     AccountProviderSpec {
         base: "claude-code",
         display_name: "Claude Code",
         access_note: CLAUDE_CODE_ACCESS_NOTE,
+        reports_usage: true,
     },
 ];
 
@@ -218,6 +258,7 @@ pub fn account_descriptor(base: &str, account_id: &str) -> Option<SourceDescript
         access_note: spec.access_note,
         credential: CredentialKind::LocalLogin,
         oauth_cache_key: Some(account_cache_key(spec.base, account_id)),
+        reports_usage: spec.reports_usage,
     })
 }
 
@@ -327,6 +368,7 @@ mod tests {
             access_note: "note",
             credential: CredentialKind::LocalLogin,
             oauth_cache_key: None,
+            reports_usage: true,
         }
     }
 
@@ -337,6 +379,7 @@ mod tests {
             access_note: "note",
             credential: CredentialKind::ApiKey,
             oauth_cache_key: None,
+            reports_usage: true,
         }
     }
 
@@ -661,6 +704,26 @@ mod tests {
         let note = openrouter.access_note.to_lowercase();
         assert!(note.contains("keychain"), "discloses keychain storage");
         assert!(note.contains("api key"), "names the credential");
+    }
+
+    #[test]
+    fn catalog_ships_openai_and_anthropic_as_distinct_api_key_sources() {
+        let catalog = source_catalog();
+        for (id, name) in [("openai", "OpenAI API"), ("anthropic", "Anthropic API")] {
+            let src = find_source(&catalog, &ProviderId::new(id)).expect("source in catalog");
+            assert_eq!(src.credential, CredentialKind::ApiKey);
+            assert_eq!(src.display_name, name);
+            assert!(
+                src.access_note.to_lowercase().contains("keychain"),
+                "{id} discloses keychain storage"
+            );
+        }
+        // The Anthropic *API* source stays siloed from the Claude Code *subscription* source:
+        // distinct ids and distinct display names, so they never collide into one tile (AC4).
+        let anthropic = find_source(&catalog, &ProviderId::new("anthropic")).unwrap();
+        let claude = find_source(&catalog, &ProviderId::new("claude-code")).unwrap();
+        assert_ne!(anthropic.id, claude.id);
+        assert_ne!(anthropic.display_name, claude.display_name);
     }
 
     #[tokio::test]

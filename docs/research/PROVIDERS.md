@@ -98,7 +98,8 @@ Recommended build order: **OpenRouter → Codex → Claude Code → OpenAI API �
 ### Anthropic API — Admin-key-gated
 - **Auth:** **Admin key `sk-ant-admin…`** only (org-scoped, individuals can't get one).
   Header: `x-api-key` + `anthropic-version: 2023-06-01`.
-- **Endpoints:** `GET /v1/organizations/cost_report` (USD, `1d` bucket only) and
+- **Endpoints:** `GET /v1/organizations/cost_report` (`amount` is USD in lowest units = **cents**,
+  so ÷100 for dollars; `1d` bucket only) and
   `/v1/organizations/usage_report/messages` (tokens, `1m/1h/1d`). Caps: `1d` ≤ 31 buckets →
   fix `bucket_width=1d, limit=31` for a rolling ~30-day window. Data lag ~5 min; poll ≤1/min.
 - **Challenge:** the key, not the code. UI must detect "normal key → no API cost data."

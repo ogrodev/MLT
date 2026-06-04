@@ -14,6 +14,7 @@ import {
   sourceActive,
   sourceTabLabel,
   type UsageRecords,
+  usageNoteText,
   usageWindowKey,
 } from './usageState';
 
@@ -25,6 +26,7 @@ function source(overrides: Partial<SourceState>): SourceState {
     present: true,
     enabled: true,
     credential: 'LocalLogin',
+    reports_usage: true,
     label: null,
     account: null,
     ...overrides,
@@ -46,6 +48,7 @@ function snapshot(provider: string, email: string | null): UsageSnapshot {
     status: 'Ok',
     fetched_at: 1_700_000_000_000,
     account: email ? { email, organization: null } : null,
+    note: null,
   };
 }
 
@@ -117,11 +120,9 @@ describe('usage state', () => {
     );
   });
 
-  it('matches backend usage routing and source activation rules', () => {
-    expect(reportsUsage('claude-code')).toBe(true);
-    expect(reportsUsage('codex:acct-1')).toBe(true);
-    expect(reportsUsage('claude-code:acct-2')).toBe(true);
-    expect(reportsUsage('openrouter')).toBe(true);
+  it('uses capability-driven usage reporting and source activation rules', () => {
+    expect(reportsUsage(source({ reports_usage: true }))).toBe(true);
+    expect(reportsUsage(source({ reports_usage: false }))).toBe(false);
 
     expect(sourceActive(source({ credential: 'LocalLogin', present: true, enabled: true }))).toBe(
       true,
@@ -132,6 +133,18 @@ describe('usage state', () => {
     expect(sourceActive(source({ credential: 'ApiKey', present: false, enabled: true }))).toBe(
       true,
     );
+  });
+
+  it('formats typed usage notes for display', () => {
+    // The contract is the `$` + 2-decimal formatting (12.5 -> '12.50'), not the surrounding copy
+    // — assert only that, mirroring the sibling org_admin case below (robust to copy edits).
+    expect(usageNoteText({ kind: 'api_spend', usd: 12.5 })).toContain('$12.50');
+    // The exact wording is copy, not a contract (tasks 007/008 require an *honest* limitation
+    // message, not a verbatim sentence). Assert the load-bearing behavior: a non-empty message
+    // that explains the admin-key requirement — robust to harmless copy edits.
+    const orgAdmin = usageNoteText({ kind: 'org_admin_key_required' });
+    expect(orgAdmin.length).toBeGreaterThan(0);
+    expect(orgAdmin.toLowerCase()).toContain('admin key');
   });
 
   it('uses account organization to disambiguate per-account tab labels', () => {
