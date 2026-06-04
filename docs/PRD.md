@@ -24,7 +24,7 @@ Each item links to its detailed requirements + acceptance criteria below.
 | ✅ | [At-a-glance usage tracking](#2-at-a-glance-usage-tracking) | windows, %, countdowns, auto-refresh (for connected providers) |
 | ✅ | [Provider coverage](#3-provider-coverage) | Claude Code ✅; Codex ✅; OpenRouter ✅; OpenAI API ✅; Anthropic API ✅ (API cost shown as an honest spend note — these APIs expose no quota to render as %) |
 | 🟡 | [Connecting accounts: credentials & consent](#4-connecting-accounts-credentials--consent) | Claude reuse + refresh ✅; source discovery + per-source consent UI ✅; API-key entry/replace/remove ✅; disconnect ✅ |
-| ◻ | [Alarms & notifications](#5-alarms--notifications) | threshold + user-defined alarms → OS notifications |
+| 🟡 | [Alarms & notifications](#5-alarms--notifications) | threshold alerts + window-reset + one-off + recurring alarms + launch/wake catch-up implemented and unit-tested; native delivery wired via tauri-plugin-notification — pending live notification QA + cross-platform lanes |
 | ◻ | [Calendar awareness (read-only)](#6-calendar-awareness-read-only) | Google / Outlook / Apple calendars |
 | 🟡 | [Reliability & always-on](#7-reliability--always-on) | resilience + refresh loop ✅; login-item + wake catch-up ◻ |
 | 🟡 | [Cross-platform support](#8-cross-platform-support) | compiles for Linux in CI; only run/verified on macOS |

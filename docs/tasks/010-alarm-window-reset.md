@@ -2,7 +2,7 @@
 
 > Optionally get pinged when a usage window resets, so I know my budget is fresh.
 
-**Capability:** [§5 Alarms & notifications](../PRD.md#5-alarms--notifications) · **Status:** ◻ not started · **Depends on:** 009
+**Capability:** [§5 Alarms & notifications](../PRD.md#5-alarms--notifications) · **Status:** 🟡 partial · **Depends on:** 009
 
 ## User story
 As a user, I want an optional notification when a tracked window resets, so I know when my
@@ -13,15 +13,21 @@ quota is back without checking manually.
 - **Out:** Threshold alerts (009); user-defined alarms (011–012).
 
 ## Acceptance criteria
-- [ ] I can turn **window-reset notifications on or off** (off is a valid default per my setting).
+- [x] I can turn **window-reset notifications on or off** (off is a valid default per my setting).
 - [ ] When enabled, a notification fires when a tracked window **resets**, naming the
       **provider and window**.
-- [ ] When disabled, **no** reset notification fires.
+- [x] When disabled, **no** reset notification fires.
 - [ ] Delivered via the OS notification centre and respects **Do-Not-Disturb**.
 
 ## Done
 Meets the [shared Definition of Done](./README.md#shared-definition-of-done-applies-to-every-task).
 Tests use a fake clock to fire a reset deterministically.
+
+**Status note (2026-06-04):** Implemented — `detect_reset` (core, unit-tested: no fire on first
+observation, fires when `resets_at` advances), the per-(provider,window) on/off setting defaulting
+off, the `set_reset_notification` command, the usage-refresh hook, and the Usage-alerts UI toggle.
+The unchecked criteria assert the **rendered** reset notification (delivery / DND), pending live
+`make qa` on macOS and the cross-platform CI lanes.
 
 ## References
 - [ADR 0009 — alarm engine](../adr/0009-alarm-engine.md)
