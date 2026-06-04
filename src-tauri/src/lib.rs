@@ -236,22 +236,51 @@ async fn apply_api_key(
     consent.set_enabled(id, true).map_err(|e| e.to_string())
 }
 
+/// The provider that validates a pasted key for a `CredentialKind::ApiKey` source — the single,
+/// pure (no-network) mapping from a source id to its validator. Keeping the routing pure lets
+/// [`every_api_key_source_has_a_validator`] assert the catalog and this dispatch never drift, the
+/// way [`reports_usage_matches_the_usage_route`] guards the usage side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiKeyProvider {
+    OpenRouter,
+    OpenAi,
+    Anthropic,
+}
+
+/// Route a source id to the provider that validates its API key, or `None` when none claims it.
+/// `None` here means a `CredentialKind::ApiKey` source was added to the catalog without wiring a
+/// validator (a bug the parity test catches) — *not* that the source lacks an API key; the caller
+/// has already confirmed it uses one.
+fn api_key_provider(id: &ProviderId) -> Option<ApiKeyProvider> {
+    match id.as_str() {
+        "openrouter" => Some(ApiKeyProvider::OpenRouter),
+        "openai" => Some(ApiKeyProvider::OpenAi),
+        "anthropic" => Some(ApiKeyProvider::Anthropic),
+        _ => None,
+    }
+}
+
 /// Validate a pasted API key against the correct provider before it is stored. Each API-key
 /// provider exposes its own `validate_key` (distinct endpoint, headers, and messages); routing by
 /// source id keeps a key from being checked against — or accepted by — the wrong provider. The
 /// returned `Err` carries that provider's own user-facing message.
 async fn validate_api_key(id: &ProviderId, http: &dyn HttpPort, key: &str) -> Result<(), String> {
-    match id.as_str() {
-        "openrouter" => mlt_core::providers::openrouter::validate_key(http, key)
+    match api_key_provider(id) {
+        Some(ApiKeyProvider::OpenRouter) => {
+            mlt_core::providers::openrouter::validate_key(http, key)
+                .await
+                .map_err(|e| e.to_string())
+        }
+        Some(ApiKeyProvider::OpenAi) => mlt_core::providers::openai::validate_key(http, key)
             .await
             .map_err(|e| e.to_string()),
-        "openai" => mlt_core::providers::openai::validate_key(http, key)
+        Some(ApiKeyProvider::Anthropic) => mlt_core::providers::anthropic::validate_key(http, key)
             .await
             .map_err(|e| e.to_string()),
-        "anthropic" => mlt_core::providers::anthropic::validate_key(http, key)
-            .await
-            .map_err(|e| e.to_string()),
-        _ => Err("This source does not use an API key".into()),
+        None => Err(format!(
+            "No API-key validator is wired for source '{}'",
+            id.as_str()
+        )),
     }
 }
 
@@ -670,14 +699,16 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_api_key, descriptor_for, disconnect, usage_route, UsageRoute};
+    use super::{
+        api_key_provider, apply_api_key, descriptor_for, disconnect, usage_route, UsageRoute,
+    };
     use super::{popover_action, PopoverAction, REOPEN_DEBOUNCE};
     use async_trait::async_trait;
     use mlt_core::domain::{AccountIdentity, ProviderId};
     use mlt_core::ports::{
         ConsentStore, HttpPort, HttpRequest, HttpResponse, IdentityStore, PortError, SecretStore,
     };
-    use mlt_core::sources::{account_descriptor, find_source, source_catalog};
+    use mlt_core::sources::{account_descriptor, find_source, source_catalog, CredentialKind};
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -854,6 +885,23 @@ mod tests {
         assert_eq!(d.reports_usage, usage_route(&d.id).is_some());
         let d = account_descriptor("claude-code", "acct").unwrap();
         assert_eq!(d.reports_usage, usage_route(&d.id).is_some());
+    }
+
+    #[test]
+    fn every_api_key_source_has_a_validator() {
+        // Mirror of `reports_usage_matches_the_usage_route` for the validation side: any source the
+        // catalog marks `CredentialKind::ApiKey` MUST resolve to a real `validate_api_key` arm. A
+        // new API-key source added without wiring a validator would otherwise fall through to the
+        // "no validator wired" error at connect time instead of validating the key.
+        for descriptor in source_catalog() {
+            if descriptor.credential == CredentialKind::ApiKey {
+                assert!(
+                    api_key_provider(&descriptor.id).is_some(),
+                    "{} is an API-key source with no validator wired in validate_api_key",
+                    descriptor.id.as_str()
+                );
+            }
+        }
     }
 
     #[tokio::test]

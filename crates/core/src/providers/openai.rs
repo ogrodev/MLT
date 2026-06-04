@@ -11,20 +11,23 @@
 //!   200 (lists models) and a 403 (authenticates but this scope can't list them) both mean a
 //!   *valid* key; only a 401 is a real rejection.
 //! - **Usage** ([`OpenAiStrategy`]): poll `GET /v1/organization/costs` for the last ~30 days of
-//!   spend. On 200 we report the **real USD total as a typed note** — never a percentage
-//!   bar, because these endpoints expose spend with no quota, so a percent would be invented
-//!   (ADR 0015). On 403 (the common non-admin key) we report the limitation honestly, as a typed
-//!   note, with no window — which is *not* an error.
+//!   spend. On 200 we report the **real USD total as a typed note** — never a percentage bar,
+//!   because these endpoints expose spend with no quota, so a percent would be invented
+//!   (ADR 0015). The common personal/non-admin key can't read org costs: OpenAI answers it with a
+//!   **401** whose body says `insufficient_permissions` / "Missing scopes" — its documented 403 is
+//!   geo-restriction only, not a scope refusal. The shared [`cost_provider::cost_note`] reads that
+//!   marker and reports the limitation honestly as a typed note with no window — *not* an error
+//!   and *not* a rejection (the whole point of task 007).
 //!
 //! All HTTP IO is injected via [`HttpPort`] and the key is read via [`SecretStore`], so the
 //! parsing/decision logic is pure and unit-tested against fakes — no live account is touched in
 //! `cargo test` (a live check is the hand-run `openai_live` example).
-use crate::domain::{Status, Timestamp, UsageNote, UsageSnapshot};
-use crate::ports::{Clock, HttpPort, HttpRequest, SecretStore};
+use crate::domain::{Status, Timestamp, UsageSnapshot};
+use crate::ports::{Clock, HttpPort, SecretStore};
 use async_trait::async_trait;
 use std::sync::Arc;
 
-use super::cost_provider::{self, CostOutcome, KeyVerdict};
+use super::cost_provider::{self, bearer_get, KeyVerdict};
 use super::{FetchContext, FetchError, FetchKind, FetchStrategy};
 
 /// OpenAI's model-list endpoint. A 200 authenticated GET proves the key works; it is the cheapest
@@ -92,58 +95,17 @@ pub struct Costs {
     pub total_spend_usd: f64,
 }
 
-/// One USD amount, however `/v1/organization/costs` spells it: the real shape is an
-/// `{ "value": <number>, "currency": "usd" }` object, but we also accept a bare JSON number or a
-/// numeric string. Anything else — absent, null, non-numeric — reads as `0.0` (ADR 0015 lossy
-/// decoding): a garbled or non-finite amount is dropped from the sum, never fatal.
-fn amount_usd(amount: &serde_json::Value) -> f64 {
-    let value = match amount {
-        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
-        serde_json::Value::String(s) => s.trim().parse::<f64>().unwrap_or(0.0),
-        serde_json::Value::Object(_) => amount.get("value").map_or(0.0, amount_usd),
-        _ => 0.0,
-    };
-    // A numeric string can parse to a non-finite f64 ("NaN", "inf"); flatten it to 0.0 so it can
-    // never poison the sum or typed usage note (ADR 0015 lossy decoding; matches Anthropic).
-    if value.is_finite() {
-        value
-    } else {
-        0.0
-    }
-}
-
 /// Parse `GET /v1/organization/costs`. Bad JSON is fatal (an upstream error); every other
 /// imperfection is absorbed (ADR 0015): a missing `data`/`results` array, a result with no
-/// amount, or a garbled amount all contribute `0.0` rather than failing the snapshot. The total
-/// is the sum of every USD amount across all daily buckets in the window.
+/// amount, or a garbled amount all contribute `0.0` rather than failing the snapshot. OpenAI
+/// reports dollars, so the shared [`cost_provider::sum_spend`] traversal needs no scaling
+/// (`units_per_usd = 1.0`).
 pub fn parse_costs(body: &str) -> Result<Costs, FetchError> {
     let value: serde_json::Value =
         serde_json::from_str(body).map_err(|e| FetchError::Upstream(format!("bad json: {e}")))?;
-    let total_spend_usd: f64 = value
-        .get("data")
-        .and_then(|data| data.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|bucket| bucket.get("results"))
-        .filter_map(|results| results.as_array())
-        .flatten()
-        .filter_map(|result| result.get("amount"))
-        .map(amount_usd)
-        .sum();
-    Ok(Costs { total_spend_usd })
-}
-
-/// A bearer-authenticated `GET` of `url` asking for JSON. Shared by the models and cost calls.
-fn bearer_get(url: &str, key: &str) -> HttpRequest {
-    HttpRequest {
-        method: "GET".into(),
-        url: url.into(),
-        headers: vec![
-            ("Authorization".into(), format!("Bearer {key}")),
-            ("Accept".into(), "application/json".into()),
-        ],
-        body: None,
-    }
+    Ok(Costs {
+        total_spend_usd: cost_provider::sum_spend(&value, 1.0),
+    })
 }
 
 /// The API-key fetch strategy for OpenAI: read the user-entered key from our keychain (via the
@@ -175,24 +137,9 @@ impl FetchStrategy for OpenAiStrategy {
             .ok_or(FetchError::Unavailable)?;
         let now = self.clock.now();
         let resp = self.http.send(bearer_get(&costs_url(now), &key)).await?;
-        let note = match cost_provider::classify_cost_status(resp.status) {
-            CostOutcome::Ok => {
-                let costs = parse_costs(&String::from_utf8_lossy(&resp.body))?;
-                UsageNote::ApiSpend {
-                    usd: costs.total_spend_usd,
-                }
-            }
-            CostOutcome::OrgLimitation => UsageNote::OrgAdminKeyRequired,
-            CostOutcome::Revoked => {
-                return Err(FetchError::Upstream(
-                    "OpenAI rejected the key — reconnect it".into(),
-                ))
-            }
-            CostOutcome::RateLimited => return Err(FetchError::RateLimited),
-            CostOutcome::Unexpected(status) => {
-                return Err(FetchError::Upstream(format!("HTTP {status}")))
-            }
-        };
+        let note = cost_provider::cost_note(resp.status, &resp.body, "OpenAI", |body| {
+            Ok(parse_costs(body)?.total_spend_usd)
+        })?;
         Ok(UsageSnapshot {
             provider: ctx.provider.clone(),
             windows: Vec::new(),
@@ -434,8 +381,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_reports_the_org_limitation_on_a_401_insufficient_permissions() {
+        // OpenAI's REAL non-admin response: the cost endpoint refuses a valid personal key with a
+        // 401 `insufficient_permissions` / "Missing scopes" body (its 403 is geo-only). This must
+        // read as the honest limitation — Status::Ok, no window, OrgAdminKeyRequired — NOT the
+        // "rejected — reconnect it" error a bare 401 yields, or a freshly-connected valid key would
+        // immediately look broken (the exact failure task 007 exists to prevent).
+        let url = costs_url(Timestamp(FETCHED_AT));
+        let body = r#"{"error":{"type":"insufficient_permissions","code":"insufficient_permissions","message":"You have insufficient permissions for this operation. Missing scopes: api.usage.read"}}"#;
+        let strat = strategy(
+            Some("sk-personal"),
+            ScriptedHttp::new(&[(url.as_str(), 401, body)]),
+        );
+        let snap = strat
+            .fetch(&ctx())
+            .await
+            .expect("an insufficient-permissions 401 is the honest limitation, not an error");
+        assert_eq!(snap.status, Status::Ok);
+        assert!(snap.windows.is_empty());
+        assert_eq!(snap.note, Some(UsageNote::OrgAdminKeyRequired));
+    }
+
+    #[tokio::test]
     async fn fetch_maps_a_revoked_key_to_an_error() {
-        // A 401 (unlike 403) means the key was since revoked — a real error, not a limitation.
+        // A bare 401 (no insufficient-permissions marker) is a since-revoked key — a real error,
+        // not a limitation; the marker-bearing non-admin 401 is the honest note tested above.
         let url = costs_url(Timestamp(FETCHED_AT));
         let strat = strategy(
             Some("sk-bad"),

@@ -160,4 +160,38 @@ mod tests {
         };
         assert_eq!(over.remaining_percent(), 0.0);
     }
+
+    #[test]
+    fn usage_note_serializes_to_the_tagged_wire_shape_the_frontend_expects() {
+        // The popover's only honesty surface (tasks 007/008) is hand-synced with this exact wire
+        // shape in src/lib/usage.ts. Pin it so a Rust-side variant rename or a dropped `rename_all`
+        // fails CI here — before it reaches the frontend, whose exhaustive switch only catches an
+        // *added* variant, never a renamed `kind` (which would silently render as garbage).
+        assert_eq!(
+            serde_json::to_value(UsageNote::ApiSpend { usd: 12.5 }).unwrap(),
+            serde_json::json!({ "kind": "api_spend", "usd": 12.5 })
+        );
+        assert_eq!(
+            serde_json::to_value(UsageNote::OrgAdminKeyRequired).unwrap(),
+            serde_json::json!({ "kind": "org_admin_key_required" })
+        );
+    }
+
+    #[test]
+    fn usage_snapshot_deserializes_without_a_note_field() {
+        // `#[serde(default)]` on `note` keeps a snapshot serialized before the field existed (or
+        // any payload that omits it) deserializing cleanly to `note: None`, never erroring.
+        let mut value = serde_json::to_value(UsageSnapshot {
+            provider: ProviderId::new("openai"),
+            windows: Vec::new(),
+            status: Status::Ok,
+            fetched_at: Timestamp(1_700_000_000_000),
+            account: None,
+            note: Some(UsageNote::ApiSpend { usd: 1.0 }),
+        })
+        .unwrap();
+        value.as_object_mut().unwrap().remove("note");
+        let snap: UsageSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(snap.note, None);
+    }
 }

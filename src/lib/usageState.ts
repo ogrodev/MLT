@@ -36,8 +36,11 @@ export function usageNoteText(note: UsageNote): string {
     case 'org_admin_key_required':
       return "This key can't read organization usage — it needs an organization admin key, which individual accounts usually can't create.";
     default: {
-      const exhaustive: never = note;
-      return exhaustive;
+      // Exhaustiveness guard: adding a UsageNote variant without a case fails to type-check here.
+      // At runtime an unforeseen `kind` (backend/frontend skew) falls back to '' rather than
+      // rendering "[object Object]".
+      note satisfies never;
+      return '';
     }
   }
 }

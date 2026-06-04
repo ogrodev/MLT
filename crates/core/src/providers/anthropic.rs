@@ -23,7 +23,7 @@
 //! All HTTP IO is injected via [`HttpPort`] and the key is read via [`SecretStore`], so the
 //! parsing/decision logic is pure and unit-tested against fakes — no live account is touched in
 //! `cargo test` (a live check is the hand-run `anthropic_live` example).
-use crate::domain::{Status, Timestamp, UsageNote, UsageSnapshot};
+use crate::domain::{Status, Timestamp, UsageSnapshot};
 use crate::ports::{Clock, HttpPort, HttpRequest, SecretStore};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -120,58 +120,23 @@ pub struct CostReport {
     pub total_spend_usd: f64,
 }
 
-/// Coerce one JSON amount to a number (the cost report's lowest currency units — cents),
-/// a numeric string (`"12.34"`, as Anthropic sends), or an `{ "value": <number> }` wrapper (as
-/// the sibling OpenAI cost report sends). Anything else — null, a non-numeric string, an odd
-/// object — reads as 0.0, and a non-finite result is flattened to 0.0 so it can never poison the
-/// sum (ADR 0015 lossy decoding).
-fn coerce_amount(value: &serde_json::Value) -> f64 {
-    let amount = match value {
-        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
-        serde_json::Value::String(s) => s.trim().parse::<f64>().unwrap_or(0.0),
-        serde_json::Value::Object(_) => value.get("value").map(coerce_amount).unwrap_or(0.0),
-        _ => 0.0,
-    };
-    if amount.is_finite() {
-        amount
-    } else {
-        0.0
-    }
-}
-
-/// One result's USD amount: prefer its `amount` field (the cost report's shape), else coerce the
-/// result node itself — so the parser stays robust whether the amount is nested or bare.
-fn result_amount(result: &serde_json::Value) -> f64 {
-    coerce_amount(result.get("amount").unwrap_or(result))
-}
-
 /// Parse the org cost report. Bad JSON is fatal (an upstream error); everything below that is
 /// lossy — a missing `data`/`results` array, an absent or garbled amount, all read as 0.0, never
-/// an error (ADR 0015). The report nests daily buckets under `data`, each with a `results` array
-/// of cent amounts; we sum them, then convert once to USD dollars (see the units note below).
+/// an error (ADR 0015). Anthropic reports each `amount` in the currency's lowest units — cents —
+/// as a decimal string (e.g. "123.45" == $1.2345), so the shared [`cost_provider::sum_spend`]
+/// traversal divides by `units_per_usd = 100.0` to convert the cent sum to dollars.
+/// Docs: https://platform.claude.com/docs/en/api/admin/cost_report.
 pub fn parse_cost_report(body: &str) -> Result<CostReport, FetchError> {
     let value: serde_json::Value =
         serde_json::from_str(body).map_err(|e| FetchError::Upstream(format!("bad json: {e}")))?;
-    // Anthropic reports each `amount` in the currency's lowest units — cents — as a decimal
-    // string (e.g. "123.45" USD == $1.2345), so the bucket sum is in cents; convert to dollars
-    // once here. Docs: https://platform.claude.com/docs/en/api/admin/cost_report.
-    let total_cents: f64 = value
-        .get("data")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|bucket| bucket.get("results").and_then(serde_json::Value::as_array))
-        .flatten()
-        .map(result_amount)
-        .sum();
     Ok(CostReport {
-        total_spend_usd: total_cents / 100.0,
+        total_spend_usd: cost_provider::sum_spend(&value, 100.0),
     })
 }
 
 /// An Anthropic-authenticated `GET` of `url` asking for JSON. Emits the three headers every
 /// Anthropic API call needs — `x-api-key`, the dated `anthropic-version`, and `Accept` — shared
-/// by validation and the cost read (mirrors OpenRouter's `bearer_get`, with Anthropic's scheme).
+/// by validation and the cost read (the [`cost_provider::bearer_get`] sibling, with Anthropic's scheme).
 fn anthropic_get(url: &str, key: &str) -> HttpRequest {
     HttpRequest {
         method: "GET".into(),
@@ -217,24 +182,9 @@ impl FetchStrategy for AnthropicStrategy {
             .http
             .send(anthropic_get(&cost_report_url(now), &key))
             .await?;
-        let note = match cost_provider::classify_cost_status(resp.status) {
-            cost_provider::CostOutcome::Ok => {
-                let report = parse_cost_report(&String::from_utf8_lossy(&resp.body))?;
-                UsageNote::ApiSpend {
-                    usd: report.total_spend_usd,
-                }
-            }
-            cost_provider::CostOutcome::OrgLimitation => UsageNote::OrgAdminKeyRequired,
-            cost_provider::CostOutcome::Revoked => {
-                return Err(FetchError::Upstream(
-                    "Anthropic rejected the key — reconnect it".into(),
-                ))
-            }
-            cost_provider::CostOutcome::RateLimited => return Err(FetchError::RateLimited),
-            cost_provider::CostOutcome::Unexpected(status) => {
-                return Err(FetchError::Upstream(format!("HTTP {status}")))
-            }
-        };
+        let note = cost_provider::cost_note(resp.status, &resp.body, "Anthropic", |body| {
+            Ok(parse_cost_report(body)?.total_spend_usd)
+        })?;
         Ok(UsageSnapshot {
             provider: ctx.provider.clone(),
             // No quota means no honest percentage, so we render no window — the note carries the

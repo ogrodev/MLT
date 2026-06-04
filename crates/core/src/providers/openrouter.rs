@@ -15,11 +15,11 @@
 //! parsing/decision logic is pure and unit-tested against fakes — no live account is touched in
 //! `cargo test` (a live check is the hand-run `openrouter_live` example).
 use crate::domain::{Status, UsageSnapshot, UsageWindow, WindowKind};
-use crate::ports::{Clock, HttpPort, HttpRequest, SecretStore};
-use crate::sources::api_key_secret_key;
+use crate::ports::{Clock, HttpPort, SecretStore};
 use async_trait::async_trait;
 use std::sync::Arc;
 
+use super::cost_provider::{self, bearer_get};
 use super::{FetchContext, FetchError, FetchKind, FetchStrategy};
 
 /// OpenRouter's key-info endpoint. A 200 authenticated GET proves the key works (used by
@@ -160,19 +160,6 @@ pub fn usage_windows(key: &KeyInfo, credits: Option<&Credits>) -> Vec<UsageWindo
     }]
 }
 
-/// A bearer-authenticated `GET` of `url` asking for JSON. Shared by the key and credits calls.
-fn bearer_get(url: &str, key: &str) -> HttpRequest {
-    HttpRequest {
-        method: "GET".into(),
-        url: url.into(),
-        headers: vec![
-            ("Authorization".into(), format!("Bearer {key}")),
-            ("Accept".into(), "application/json".into()),
-        ],
-        body: None,
-    }
-}
-
 /// The API-key fetch strategy for OpenRouter: read the user-entered key from our keychain (via
 /// the [`SecretStore`] port — never the network) and poll the key + credits endpoints. There is
 /// no OAuth to refresh, so this strategy only ever *reads* the stored key and writes nothing
@@ -191,11 +178,12 @@ impl FetchStrategy for OpenRouterStrategy {
     }
 
     async fn is_available(&self, ctx: &FetchContext) -> bool {
-        self.api_key(ctx).is_some()
+        cost_provider::read_api_key(self.secrets.as_ref(), &ctx.provider).is_some()
     }
 
     async fn fetch(&self, ctx: &FetchContext) -> Result<UsageSnapshot, FetchError> {
-        let key = self.api_key(ctx).ok_or(FetchError::Unavailable)?;
+        let key = cost_provider::read_api_key(self.secrets.as_ref(), &ctx.provider)
+            .ok_or(FetchError::Unavailable)?;
         let resp = self.http.send(bearer_get(KEY_URL, &key)).await?;
         let key_info = match resp.status {
             200 => parse_key_info(&String::from_utf8_lossy(&resp.body))?,
@@ -240,24 +228,11 @@ impl FetchStrategy for OpenRouterStrategy {
     }
 }
 
-impl OpenRouterStrategy {
-    /// The user-entered key from our keychain for this source — trimmed and non-empty — or
-    /// `None` when the source isn't connected (no key stored), which reads as "unavailable".
-    fn api_key(&self, ctx: &FetchContext) -> Option<String> {
-        self.secrets
-            .get(&api_key_secret_key(&ctx.provider))
-            .ok()
-            .flatten()
-            .map(|key| key.trim().to_string())
-            .filter(|key| !key.is_empty())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::{ProviderId, Timestamp};
-    use crate::ports::{HttpResponse, PortError};
+    use crate::ports::{HttpRequest, HttpResponse, PortError};
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
