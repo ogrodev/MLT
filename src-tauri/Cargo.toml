@@ -22,14 +22,14 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
-tokio = { version = "1", features = ["time"] }
+tauri-plugin-notification = "2"
+async-trait = { workspace = true }
+tokio = { version = "1", features = ["macros", "sync", "time"] }
 mlt-core = { workspace = true }
 mlt-adapters = { workspace = true }
 # Typed payloads for the events emitted to the popover (e.g. the per-provider usage-error).
 serde = { workspace = true }
 
 [dev-dependencies]
-# Test-only: async executor + trait macro for the API-key command tests (fakes for the
-# SecretStore / ConsentStore / HttpPort ports). Not pulled into production builds.
-async-trait = { workspace = true }
+# Test-only: async executor for command tests.
 tokio = { version = "1", features = ["macros", "rt"] }
