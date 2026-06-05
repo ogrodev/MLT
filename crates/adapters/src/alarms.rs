@@ -60,9 +60,13 @@ fn load_or_quarantine<T: Default>(
     path: &Path,
     parse: impl FnOnce(&str) -> Result<T, serde_json::Error>,
 ) -> T {
-    let Ok(raw) = std::fs::read_to_string(path) else {
+    // Read raw bytes and decode lossily (ADR 0015): a present-but-non-UTF8 file must still reach
+    // the parse failure below and be quarantined, not skip straight to the default — otherwise the
+    // next persist would overwrite and lose the original bytes. Missing/unreadable files default.
+    let Ok(bytes) = std::fs::read(path) else {
         return T::default();
     };
+    let raw = String::from_utf8_lossy(&bytes);
     match parse(&raw) {
         Ok(value) => value,
         Err(error) => {
@@ -109,7 +113,18 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), PortError> {
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         PortError::Io(e.to_string())
-    })
+    })?;
+    // Best-effort: fsync the parent directory so the rename (the directory-entry update) is itself
+    // crash-durable, completing the persist-before-notify guarantee — the temp file's sync_all()
+    // above commits only the file data, not the rename. Skipped where directory fsync is
+    // unsupported; the data is written regardless.
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -379,6 +394,27 @@ mod tests {
         ] {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    #[tokio::test]
+    async fn a_non_utf8_file_is_quarantined_not_silently_overwritten() {
+        // Invalid UTF-8 bytes: `read_to_string` would have errored and skipped quarantine
+        // entirely, letting the next persist overwrite (lose) the file. Lossy decode routes it to
+        // the parse failure and quarantine instead.
+        let alarms_path = temp_path("non-utf8-alarms");
+        let settings_path = temp_path("non-utf8-settings"); // missing -> default
+        std::fs::write(&alarms_path, [0xffu8, 0xfe, 0x00, 0x80]).unwrap();
+
+        let store = FileAlarmStore::load(alarms_path.clone(), settings_path.clone());
+        assert_eq!(store.alarms().await.unwrap(), Vec::<Alarm>::new());
+
+        // The non-UTF8 file was moved aside (recoverable), not left in place to be overwritten.
+        let alarms_corrupt = with_suffix(&alarms_path, ".corrupt");
+        assert!(alarms_corrupt.exists(), "non-UTF8 file must be quarantined");
+        assert!(!alarms_path.exists());
+
+        let _ = std::fs::remove_file(&alarms_corrupt);
+        let _ = std::fs::remove_file(&settings_path);
     }
 
     #[tokio::test]

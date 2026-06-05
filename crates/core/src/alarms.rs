@@ -82,17 +82,17 @@ pub fn next_occurrence(anchor: Timestamp, after: Timestamp, recurrence: Recurren
     }
 
     let period = recurrence.period_ms();
-    // Saturating throughout: a malformed `anchor`/`after` (e.g. an out-of-range `fire_at` from a
-    // direct command invoke) must never overflow-panic — ADR 0015: the pure core never panics on
-    // untrusted input. Saturated values pin the alarm far in the future rather than wrapping into
-    // a perpetually-due past instant.
+    // Overflow-safe per ADR 0015 (the pure core never panics on untrusted input, e.g. an
+    // out-of-range `fire_at` from a direct command invoke). If the next occurrence would exceed
+    // i64::MAX it is clamped to i64::MAX — an unreachable future — rather than wrapping a
+    // saturated product back into a still-due past instant.
     let delta = after.0.saturating_sub(anchor.0);
     let periods_after_anchor = delta / period + 1;
-    Timestamp(
-        anchor
-            .0
-            .saturating_add(periods_after_anchor.saturating_mul(period)),
-    )
+    let next = periods_after_anchor
+        .checked_mul(period)
+        .and_then(|offset| anchor.0.checked_add(offset))
+        .unwrap_or(i64::MAX);
+    Timestamp(next)
 }
 
 /// Scan due alarms, decide delivery, advance recurring alarms, and complete one-offs.
@@ -299,7 +299,11 @@ impl AlarmSettings {
         find_keyed(&self.thresholds, provider, window, description)
     }
 
-    pub fn set_threshold(&mut self, config: ThresholdConfig) {
+    pub fn set_threshold(&mut self, mut config: ThresholdConfig) {
+        // Enforce the stored invariant here, not only at the IPC boundary: levels stay in
+        // 1..=100, deduped and ascending, so no caller can persist a level that fires every
+        // poll (0) or never (>100). normalize_levels is idempotent.
+        config.levels = normalize_levels(&config.levels);
         if let Some(entry) = find_keyed_mut(
             &mut self.thresholds,
             &config.provider,
@@ -666,23 +670,28 @@ mod tests {
     }
 
     #[test]
-    fn next_occurrence_saturates_instead_of_overflowing_on_extreme_inputs() {
+    fn next_occurrence_clamps_to_max_instead_of_wrapping_on_extreme_inputs() {
         // ADR 0015: the pure core must never overflow-panic on untrusted input (e.g. an
-        // out-of-range `fire_at` from a direct command invoke). A huge forward gap saturates
-        // to i64::MAX rather than wrapping into a past instant.
+        // out-of-range `fire_at` from a direct command invoke). A result beyond i64::MAX clamps
+        // to i64::MAX rather than wrapping a saturated product back into a still-due past instant.
         assert_eq!(
             next_occurrence(ts(0), ts(i64::MAX), Recurrence::Weekly).0,
             i64::MAX
         );
-        // An i64::MIN anchor that is already due must compute without panicking.
+        // A negative anchor that is already due must still yield a time STRICTLY AFTER `after`,
+        // never a wrapped still-due value (the saturating-mul-then-add bug returned -1 here).
         let advanced = next_occurrence(ts(i64::MIN), ts(0), Recurrence::Daily);
-        assert!(advanced.0 > i64::MIN);
+        assert!(
+            advanced.0 > 0,
+            "expected strictly after `after`, got {}",
+            advanced.0
+        );
     }
 
     #[test]
     fn reconcile_does_not_panic_on_extreme_fire_times() {
         // The scheduler reconciles whatever is persisted; an adversarial alarm at i64::MIN must
-        // advance via the saturating `next_occurrence` rather than overflow-panicking the task.
+        // advance via the overflow-safe `next_occurrence` — never panic, never wrap to still-due.
         let due = alarm("min", "Min", ts(i64::MIN), Some(Recurrence::Daily));
         let far = alarm("max", "Max", ts(i64::MAX), Some(Recurrence::Weekly));
 
@@ -691,7 +700,8 @@ mod tests {
         // Only the due (i64::MIN) alarm fires and advances; the far-future one is untouched.
         assert_eq!(reconciled.updated.len(), 1);
         assert_eq!(reconciled.updated[0].id, AlarmId::new("min"));
-        assert!(reconciled.updated[0].next_fire_at.0 > i64::MIN);
+        // Clamped far into the future (i64::MAX), so it is no longer due — no re-fire storm.
+        assert!(reconciled.updated[0].next_fire_at.0 > 0);
     }
 
     #[test]
@@ -1311,5 +1321,28 @@ mod tests {
         assert_eq!(prefs.thresholds, settings.thresholds);
         assert_eq!(prefs.resets, settings.resets);
         assert_eq!(prefs.missed_policy, MissedPolicy::Coalesce);
+    }
+
+    #[test]
+    fn set_threshold_normalizes_levels_before_storing() {
+        // A direct invoke or any future caller cannot persist out-of-range/duplicate/unsorted
+        // levels: set_threshold normalizes (drop 0 and >100, dedupe, sort) at the data layer.
+        let claude = provider("claude");
+        let mut settings = AlarmSettings::default();
+        settings.set_threshold(ThresholdConfig {
+            provider: claude.clone(),
+            window: WindowKind::Weekly,
+            window_description: None,
+            levels: vec![0, 95, 80, 95, 101],
+            enabled: true,
+        });
+        assert_eq!(
+            settings
+                .threshold(&claude, WindowKind::Weekly, None)
+                .unwrap()
+                .levels
+                .as_slice(),
+            &[80, 95]
+        );
     }
 }

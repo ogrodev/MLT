@@ -3,8 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mlt_core::alarms::{
-    self as core_alarms, Alarm, AlarmId, AlarmNotice, AlarmPrefs, Firing, MissedPolicy, Recurrence,
-    ThresholdConfig,
+    Alarm, AlarmId, AlarmNotice, AlarmPrefs, Firing, MissedPolicy, Recurrence, ThresholdConfig,
 };
 use mlt_core::domain::{ProviderId, Timestamp, UsageSnapshot, WindowKind};
 use mlt_core::ports::{AlarmStore, Clock, Notifier, PortError};
@@ -138,9 +137,8 @@ pub async fn set_threshold_alert(
         provider: ProviderId::new(provider),
         window,
         window_description,
-        // Sanitize at the boundary so a direct `invoke` can't bypass the UI's guard:
-        // drop levels outside 1..=100 (0 fires every poll; >100 never fires), dedupe, sort.
-        levels: core_alarms::normalize_levels(&levels),
+        // Normalized by AlarmSettings::set_threshold (kept in 1..=100, deduped, sorted).
+        levels,
         enabled,
     };
     let settings = state
