@@ -27,3 +27,5 @@ Format: lightweight [MADR](https://adr.github.io/madr/)-style.
 | [0017](./0017-provider-account-identity.md) | Provider account identity: auto-fetched, cached, siloed | Accepted |
 | [0018](./0018-multi-provider-popover.md) | Multi-provider popover: switcher + per-source custom names | Accepted |
 | [0019](./0019-multi-account-discovery.md) | Multi-account discovery: per-account sources from local OAuth stores | Accepted |
+| [0020](./0020-rrule-lite-recurrence.md) | RRULE-lite recurrence for user alarms | Accepted |
+| [0021](./0021-missed-alarm-policy.md) | Missed-alarm catch-up policy (fire-each vs coalesce) | Accepted |

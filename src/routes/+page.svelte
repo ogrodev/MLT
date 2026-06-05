@@ -14,6 +14,36 @@ import {
   type UsageSnapshot,
   type UsageWindow,
 } from '$lib/usage';
+import {
+  listAlarms,
+  createAlarm,
+  updateAlarm,
+  deleteAlarm,
+  getAlarmPrefs,
+  setThresholdAlert,
+  setResetNotification,
+  setMissedPolicy,
+  onAlarmsUpdated,
+  type Alarm,
+  type AlarmPrefs,
+  type MissedPolicy,
+  type Recurrence,
+} from '$lib/alarms';
+import {
+  describeRecurrence,
+  recurrenceFromForm,
+  recurrenceModeFor,
+  toDatetimeLocal,
+  missedPolicyFromValue,
+  type AlarmFormMode,
+  validateAlarmDraft,
+  sortAlarms,
+  fireCountdown,
+  thresholdFor,
+  resetEnabledFor,
+  formatLevels,
+  parseLevels,
+} from '$lib/alarmsState';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import {
   clearUsage,
@@ -41,7 +71,16 @@ let errors = $state<Record<string, string>>({});
 const usageRecords: UsageRecords = { snapshots, errors };
 let now = $state(Date.now());
 let sources = $state<SourceState[]>([]);
-let view = $state<'usage' | 'sources'>('usage');
+let view = $state<'usage' | 'sources' | 'alarms'>('usage');
+let alarms = $state<Alarm[]>([]);
+let alarmPrefs = $state<AlarmPrefs | null>(null);
+let alarmLabel = $state('');
+let alarmFireAtLocal = $state('');
+let alarmRecurrenceMode = $state<AlarmFormMode>('once');
+let alarmEveryN = $state(1);
+let editingAlarmId = $state<string | null>(null);
+let alarmError = $state('');
+let thresholdDrafts = $state<Record<string, string>>({});
 
 // Ephemeral key-entry state for API-key sources (e.g. OpenRouter). `editingId` is the source
 // whose key form is open; the draft is never persisted or echoed back once saved.
@@ -101,6 +140,12 @@ const selErr = $derived(selected ? errorFor(usageRecords, selected.id) : null);
 const selectedEmail = $derived(selectedAccount(selSnap, selected));
 
 const conn = $derived(connectionState(selected, selSnap, selErr));
+
+const alertSources = $derived.by(() =>
+  activeSources.filter(
+    (source) => reportsUsage(source) && (snapshots[source.id]?.windows.length ?? 0) > 0,
+  ),
+);
 
 function label(w: UsageWindow): string {
   return w.reset_description ?? KIND_LABEL[w.kind];
@@ -212,6 +257,131 @@ async function saveName(source: SourceState): Promise<void> {
   }
 }
 
+function resetAlarmForm(): void {
+  alarmLabel = '';
+  alarmFireAtLocal = '';
+  alarmRecurrenceMode = 'once';
+  alarmEveryN = 1;
+  editingAlarmId = null;
+  alarmError = '';
+}
+
+function startEditAlarm(alarm: Alarm): void {
+  editingAlarmId = alarm.id;
+  alarmLabel = alarm.label;
+  alarmFireAtLocal = toDatetimeLocal(alarm.next_fire_at);
+  alarmRecurrenceMode = recurrenceModeFor(alarm.recurrence);
+  alarmEveryN = alarm.recurrence?.kind === 'every_n_days' ? alarm.recurrence.days : 1;
+  alarmError = '';
+}
+
+async function saveAlarmDraft(): Promise<void> {
+  const fireAt = new Date(alarmFireAtLocal).getTime();
+  const validation = validateAlarmDraft(alarmLabel, fireAt, Date.now());
+  if (validation) {
+    alarmError = validation;
+    return;
+  }
+
+  const recurrence = recurrenceFromForm(
+    alarmRecurrenceMode,
+    Number.isFinite(alarmEveryN) ? alarmEveryN : 1,
+  );
+  try {
+    alarms = editingAlarmId
+      ? await updateAlarm(editingAlarmId, alarmLabel.trim(), fireAt, recurrence)
+      : await createAlarm(alarmLabel.trim(), fireAt, recurrence);
+    resetAlarmForm();
+  } catch (e) {
+    alarmError = String(e);
+  }
+}
+
+async function removeAlarm(id: string): Promise<void> {
+  try {
+    alarms = await deleteAlarm(id);
+    if (editingAlarmId === id) resetAlarmForm();
+  } catch (e) {
+    alarmError = String(e);
+  }
+}
+
+function thresholdKey(provider: string, w: UsageWindow): string {
+  return `${provider}:${w.kind}:${w.reset_description ?? ''}`;
+}
+
+function currentThreshold(provider: string, w: UsageWindow) {
+  return alarmPrefs ? thresholdFor(alarmPrefs, provider, w.kind, w.reset_description) : null;
+}
+
+function thresholdLevelsText(provider: string, w: UsageWindow): string {
+  return formatLevels(currentThreshold(provider, w)?.levels ?? []);
+}
+
+function thresholdEnabled(provider: string, w: UsageWindow): boolean {
+  return currentThreshold(provider, w)?.enabled ?? false;
+}
+
+function thresholdDraftValue(provider: string, w: UsageWindow): string {
+  return thresholdDrafts[thresholdKey(provider, w)] ?? thresholdLevelsText(provider, w);
+}
+
+function setThresholdDraft(provider: string, w: UsageWindow, value: string): void {
+  thresholdDrafts[thresholdKey(provider, w)] = value;
+}
+
+async function saveThresholdDraft(
+  provider: string,
+  w: UsageWindow,
+  value: string,
+  enabled: boolean,
+): Promise<void> {
+  setThresholdDraft(provider, w, value);
+  try {
+    alarmPrefs = await setThresholdAlert(
+      provider,
+      w.kind,
+      w.reset_description,
+      parseLevels(value),
+      enabled,
+    );
+    // Only normalize the field if the user hasn't typed something newer while the save was
+    // in flight — otherwise the post-save restore would clobber their in-progress edit.
+    if (thresholdDrafts[thresholdKey(provider, w)] === value) {
+      setThresholdDraft(provider, w, thresholdLevelsText(provider, w));
+    }
+    alarmError = '';
+  } catch (e) {
+    alarmError = String(e);
+  }
+}
+
+async function saveResetNotification(
+  provider: string,
+  w: UsageWindow,
+  enabled: boolean,
+): Promise<void> {
+  try {
+    alarmPrefs = await setResetNotification(provider, w.kind, w.reset_description, enabled);
+    alarmError = '';
+  } catch (e) {
+    alarmError = String(e);
+  }
+}
+
+function missedPolicyValue(): MissedPolicy {
+  return alarmPrefs?.missed_policy ?? 'fire_each';
+}
+
+async function saveMissedPolicy(policy: MissedPolicy): Promise<void> {
+  try {
+    alarmPrefs = await setMissedPolicy(policy);
+    alarmError = '';
+  } catch (e) {
+    alarmError = String(e);
+  }
+}
+
 onMount(() => {
   const unlisteners: Array<() => void> = [];
 
@@ -224,11 +394,25 @@ onMount(() => {
     })
     .catch(() => {});
 
+  listAlarms()
+    .then((a) => {
+      alarms = a;
+    })
+    .catch(() => {});
+  getAlarmPrefs()
+    .then((p) => {
+      alarmPrefs = p;
+    })
+    .catch(() => {});
+
   onUsageUpdated((s) => {
     recordUsage(usageRecords, s);
   }).then((u) => unlisteners.push(u));
   onUsageError((e) => {
     recordUsageError(usageRecords, e);
+  }).then((u) => unlisteners.push(u));
+  onAlarmsUpdated((a) => {
+    alarms = a;
   }).then((u) => unlisteners.push(u));
 
   // Re-discover whenever the popover regains focus (i.e. each time it's opened), so presence
@@ -299,11 +483,27 @@ onMount(() => {
       >
         Done
       </button>
+    {:else if view === 'alarms'}
+      <h1 class="text-sm font-semibold tracking-tight">Alarms</h1>
+      <button
+        type="button"
+        onclick={() => (view = 'usage')}
+        class="rounded px-2 py-0.5 text-[11px] text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+      >
+        Done
+      </button>
     {:else}
       <h1 class="min-w-0 truncate text-sm font-semibold tracking-tight">
         {selected ? selected.display_name : 'MLT'}
       </h1>
       <div class="flex shrink-0 items-center gap-2">
+        <button
+          type="button"
+          onclick={() => (view = 'alarms')}
+          class="rounded px-2 py-0.5 text-[11px] text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+        >
+          Alarms
+        </button>
         <button
           type="button"
           onclick={() => (view = 'sources')}
@@ -525,6 +725,214 @@ onMount(() => {
           </li>
         {/each}
       </ul>
+    {:else if view === 'alarms'}
+      <div class="space-y-4">
+        <section class="rounded-lg border border-neutral-200 p-3 dark:border-neutral-800">
+          <h2 class="text-[13px] font-semibold text-neutral-800 dark:text-neutral-200">
+            Your alarms
+          </h2>
+          <form
+            class="mt-3 space-y-2"
+            onsubmit={(e) => {
+              e.preventDefault();
+              saveAlarmDraft();
+            }}
+          >
+            <input
+              type="text"
+              bind:value={alarmLabel}
+              placeholder="Alarm label"
+              aria-label="Alarm label"
+              autocomplete="off"
+              class="w-full rounded-md border border-neutral-300 bg-white px-2 py-1 text-[12px] text-neutral-900 placeholder:text-neutral-400 focus:border-neutral-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-100"
+            />
+            <div class="grid grid-cols-2 gap-2">
+              <input
+                type="datetime-local"
+                bind:value={alarmFireAtLocal}
+                aria-label="Alarm time"
+                class="min-w-0 rounded-md border border-neutral-300 bg-white px-2 py-1 text-[12px] text-neutral-900 focus:border-neutral-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-100"
+              />
+              <select
+                bind:value={alarmRecurrenceMode}
+                aria-label="Alarm recurrence"
+                class="min-w-0 rounded-md border border-neutral-300 bg-white px-2 py-1 text-[12px] text-neutral-900 focus:border-neutral-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-100"
+              >
+                <option value="once">Once</option>
+                <option value="daily">Daily</option>
+                <option value="weekly">Weekly</option>
+                <option value="every_n">Every N days</option>
+              </select>
+            </div>
+            {#if alarmRecurrenceMode === 'every_n'}
+              <input
+                type="number"
+                min="1"
+                step="1"
+                bind:value={alarmEveryN}
+                aria-label="Every N days"
+                class="w-24 rounded-md border border-neutral-300 bg-white px-2 py-1 text-[12px] text-neutral-900 focus:border-neutral-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-100"
+              />
+            {/if}
+            {#if alarmError}
+              <p class="text-[11px] break-words text-red-600 dark:text-red-400">{alarmError}</p>
+            {/if}
+            <div class="flex items-center gap-2">
+              <button
+                type="submit"
+                class="rounded-md bg-neutral-900 px-3 py-1 text-[12px] font-medium text-white transition-colors hover:bg-neutral-700 dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-neutral-300"
+              >
+                {editingAlarmId ? 'Save alarm' : 'Add alarm'}
+              </button>
+              {#if editingAlarmId}
+                <button
+                  type="button"
+                  onclick={resetAlarmForm}
+                  class="rounded px-2 py-1 text-[12px] text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+                >
+                  Cancel
+                </button>
+              {/if}
+            </div>
+          </form>
+          <div class="mt-3 border-t border-neutral-100 pt-3 dark:border-neutral-800">
+            {#if alarms.length === 0}
+              <p class="text-[11px] text-neutral-500 dark:text-neutral-400">No alarms yet</p>
+            {:else}
+              <ul class="space-y-2">
+                {#each sortAlarms(alarms) as a (a.id)}
+                  <li class="flex items-start justify-between gap-3">
+                    <div class="min-w-0">
+                      <p class="truncate text-[13px] font-medium text-neutral-800 dark:text-neutral-200">
+                        {a.label}
+                      </p>
+                      <p class="text-[11px] text-neutral-500 dark:text-neutral-400">
+                        {describeRecurrence(a.recurrence)} · {fireCountdown(a.next_fire_at, now)}
+                      </p>
+                    </div>
+                    <div class="flex shrink-0 items-center gap-1">
+                      <button
+                        type="button"
+                        onclick={() => startEditAlarm(a)}
+                        class="rounded px-2 py-0.5 text-[11px] text-neutral-500 transition-colors hover:bg-neutral-200 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-neutral-800 dark:hover:text-neutral-100"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        onclick={() => removeAlarm(a.id)}
+                        class="rounded px-2 py-0.5 text-[11px] text-red-600 transition-colors hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950/40"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          </div>
+        </section>
+
+        <section class="rounded-lg border border-neutral-200 p-3 dark:border-neutral-800">
+          <h2 class="text-[13px] font-semibold text-neutral-800 dark:text-neutral-200">
+            Usage alerts
+          </h2>
+          {#if alertSources.length === 0}
+            <p class="mt-2 text-[11px] text-neutral-500 dark:text-neutral-400">
+              Connect a usage provider to set alerts
+            </p>
+          {:else}
+            <ul class="mt-3 space-y-3">
+              {#each alertSources as source (source.id)}
+                {#each snapshots[source.id]?.windows ?? [] as w, i (usageWindowKey(w, i))}
+                  <li class="rounded-md bg-neutral-50 p-2 dark:bg-neutral-800/60">
+                    <div class="flex items-baseline justify-between gap-2">
+                      <span
+                        class="min-w-0 truncate text-[13px] font-medium text-neutral-800 dark:text-neutral-200"
+                      >
+                        {tabLabel(source)} · {label(w)}
+                      </span>
+                      <span class="text-[11px] text-neutral-500 tabular-nums dark:text-neutral-400">
+                        {w.used_percent.toFixed(0)}%
+                      </span>
+                    </div>
+                    <div class="mt-2 flex flex-wrap items-center gap-2">
+                      <input
+                        type="text"
+                        value={thresholdDraftValue(source.id, w)}
+                        placeholder="80, 95"
+                        aria-label="Threshold levels for {tabLabel(source)} {label(w)}"
+                        onchange={(e) =>
+                          saveThresholdDraft(
+                            source.id,
+                            w,
+                            e.currentTarget.value,
+                            thresholdEnabled(source.id, w),
+                          )}
+                        oninput={(e) => setThresholdDraft(source.id, w, e.currentTarget.value)}
+                        class="w-24 rounded-md border border-neutral-300 bg-white px-2 py-1 text-[12px] text-neutral-900 placeholder:text-neutral-400 focus:border-neutral-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-100"
+                      />
+                      <label
+                        class="flex items-center gap-1 text-[11px] text-neutral-600 dark:text-neutral-300"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={thresholdEnabled(source.id, w)}
+                          onchange={(e) =>
+                            saveThresholdDraft(
+                              source.id,
+                              w,
+                              thresholdDraftValue(source.id, w),
+                              e.currentTarget.checked,
+                            )}
+                          class="h-3.5 w-3.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                        />
+                        Enabled
+                      </label>
+                      {#if w.resets_at !== null}
+                        <label
+                          class="flex items-center gap-1 text-[11px] text-neutral-600 dark:text-neutral-300"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={alarmPrefs
+                              ? resetEnabledFor(alarmPrefs, source.id, w.kind, w.reset_description)
+                              : false}
+                            onchange={(e) =>
+                              saveResetNotification(source.id, w, e.currentTarget.checked)}
+                            class="h-3.5 w-3.5 rounded border-neutral-300 text-neutral-900 focus:ring-neutral-500 dark:border-neutral-700 dark:bg-neutral-800"
+                          />
+                          Reset notification
+                        </label>
+                      {/if}
+                    </div>
+                  </li>
+                {/each}
+              {/each}
+            </ul>
+          {/if}
+        </section>
+
+        <section class="rounded-lg border border-neutral-200 p-3 dark:border-neutral-800">
+          <h2 class="text-[13px] font-semibold text-neutral-800 dark:text-neutral-200">
+            Missed alarms
+          </h2>
+          <div class="mt-3 flex items-center justify-between gap-3">
+            <p class="text-[11px] text-neutral-500 dark:text-neutral-400">
+              When MLT catches up after downtime
+            </p>
+            <select
+              value={missedPolicyValue()}
+              aria-label="Missed alarm policy"
+              onchange={(e) => saveMissedPolicy(missedPolicyFromValue(e.currentTarget.value))}
+              class="shrink-0 rounded-md border border-neutral-300 bg-white px-2 py-1 text-[12px] text-neutral-900 focus:border-neutral-500 focus:outline-none dark:border-neutral-700 dark:bg-neutral-800 dark:text-neutral-100"
+            >
+              <option value="fire_each">Fire each</option>
+              <option value="coalesce">Coalesce</option>
+            </select>
+          </div>
+        </section>
+      </div>
     {:else if activeSources.length === 0}
       <div class="mt-8 text-center">
         <p class="text-sm text-neutral-700 dark:text-neutral-300">No usage to show yet</p>

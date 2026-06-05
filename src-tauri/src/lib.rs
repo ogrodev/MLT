@@ -1,14 +1,16 @@
 // MLT app crate: tray + chromeless popover, wired to the provider slice in mlt-adapters.
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mlt_adapters::{
-    FileConsentStore, FileIdentityStore, FileLabelStore, KeyringSecretStore, LocalSourceProbe,
-    ReqwestHttp, KEYCHAIN_SERVICE,
+    FileAlarmStore, FileConsentStore, FileIdentityStore, FileLabelStore, KeyringSecretStore,
+    LocalSourceProbe, ReqwestHttp, SystemClock, KEYCHAIN_SERVICE,
 };
 use mlt_core::domain::{ProviderId, UsageSnapshot};
 use mlt_core::ports::{
-    ConsentStore, HttpPort, IdentityStore, SecretStore, SourceLabels, SourceProbe,
+    AlarmStore, Clock, ConsentStore, HttpPort, IdentityStore, Notifier, SecretStore, SourceLabels,
+    SourceProbe,
 };
 use mlt_core::providers::{FetchContext, FetchStrategy};
 use mlt_core::sources::{
@@ -18,7 +20,10 @@ use mlt_core::sources::{
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, Manager};
+use tauri_plugin_notification::{NotificationExt, PermissionState};
 use tauri_plugin_positioner::{Position, WindowExt};
+
+mod alarms;
 
 const POPOVER: &str = "main";
 const REFRESH_SECS: u64 = 60;
@@ -539,7 +544,8 @@ async fn refresh_active(
     for id in &ids {
         match fetch_for(id, identity.clone()).await {
             Some(Ok(snapshot)) => {
-                let _ = app.emit("usage-updated", snapshot);
+                let _ = app.emit("usage-updated", snapshot.clone());
+                alarms::evaluate_usage(app, &snapshot).await;
             }
             Some(Err(e)) => {
                 let _ = app.emit(
@@ -611,6 +617,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_positioner::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(PopoverState::default())
         .invoke_handler(tauri::generate_handler![
             fetch_usage,
@@ -619,7 +626,15 @@ pub fn run() {
             set_api_key,
             disconnect_source,
             set_source_label,
-            quit
+            quit,
+            alarms::list_alarms,
+            alarms::create_alarm,
+            alarms::update_alarm,
+            alarms::delete_alarm,
+            alarms::get_alarm_prefs,
+            alarms::set_threshold_alert,
+            alarms::set_reset_notification,
+            alarms::set_missed_policy
         ])
         .setup(|app| {
             // Menu-bar app: no Dock icon / app-switcher entry on macOS.
@@ -689,6 +704,33 @@ pub fn run() {
                 labels,
                 identity: identity.clone(),
             });
+
+            let alarms_path = app.path().app_config_dir()?.join("alarms.json");
+            let settings_path = app.path().app_config_dir()?.join("alarm-settings.json");
+            let store: Arc<dyn AlarmStore> =
+                Arc::new(FileAlarmStore::load(alarms_path, settings_path));
+            let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+            let notifier: Arc<dyn Notifier> =
+                Arc::new(alarms::TauriNotifier::new(app.handle().clone()));
+            app.manage(alarms::AlarmState {
+                store,
+                clock,
+                notifier,
+                wake: Arc::new(tokio::sync::Notify::new()),
+                seq: AtomicU64::new(0),
+            });
+            let notification_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let notification = notification_app.notification();
+                match notification.permission_state() {
+                    Ok(PermissionState::Granted) => {}
+                    Ok(_) => {
+                        let _ = notification.request_permission();
+                    }
+                    Err(_) => {}
+                }
+            });
+            alarms::spawn_alarm_scheduler(app.handle().clone());
 
             spawn_refresh_loop(app.handle().clone(), probe, consent, identity);
             Ok(())

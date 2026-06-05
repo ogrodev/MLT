@@ -31,8 +31,8 @@ a silent loose end. Each item has an owner action. Resolve → promote to an ADR
 | ~~Q2~~ | ~~Per-provider tray icon vs merged icon?~~ | **RESOLVED:** single tray icon; mirror the CodexBar experience as v0.1, then evolve. See [ADR 0013](./adr/0013-single-tray-icon.md). |
 | ~~Q3~~ | ~~Which providers ship in v1?~~ | **RESOLVED:** v1 set = Claude Code (sub), Codex (sub), Anthropic API, OpenAI API, OpenRouter API. See [ADR 0014](./adr/0014-v1-provider-set.md) + [research/PROVIDERS.md](../research/PROVIDERS.md). |
 | Q4 | What does "usage" mean per provider? | $ vs tokens vs requests vs quota headroom — normalize, but display rules differ. |
-| Q5 | Recurring alarm grammar | Full RRULE vs RRULE-lite (daily/weekly/interval). Lean lite for v1. |
-| Q6 | Missed-alarm policy | Fire each, or coalesce to one "missed N" — make it a user setting. |
+| ~~Q5~~ | ~~Recurring alarm grammar~~ | **RESOLVED:** RRULE-lite (daily / weekly / every-N-days), UTC-day arithmetic, no tz lib in core. See [ADR 0020](./adr/0020-rrule-lite-recurrence.md). |
+| ~~Q6~~ | ~~Missed-alarm policy~~ | **RESOLVED:** per-user `MissedPolicy` (fire-each / coalesce, default fire-each); a recurring alarm's missed occurrences collapse to one catch-up. See [ADR 0021](./adr/0021-missed-alarm-policy.md). |
 | Q7 | Linux tray reality | Tray support varies by desktop environment; define the supported set. |
 | Q8 | Cookie decryption scope | Which browsers in v1? Chromium DPAPI/Keychain/libsecret each differ. |
 | Q9 | Sidecar distribution | Bundle Swift/.NET helpers in the app package; signing + path resolution per OS. |

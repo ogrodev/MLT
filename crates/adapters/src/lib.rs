@@ -5,6 +5,7 @@
 //! See `docs/adr/0006-hexagonal-core.md`.
 
 pub mod accounts;
+pub mod alarms;
 pub mod anthropic;
 pub mod claude;
 pub mod clock;
@@ -20,6 +21,7 @@ pub mod secrets;
 pub mod sources;
 
 pub use accounts::discovered_accounts;
+pub use alarms::FileAlarmStore;
 pub use anthropic::anthropic_strategy;
 pub use claude::{claude_account_strategy, claude_strategy, ClaudeCredentials};
 pub use clock::SystemClock;
